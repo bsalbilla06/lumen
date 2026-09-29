@@ -18,6 +18,7 @@ from lumen.blueprints.metrics.middleware import observe_stream_abort
 from lumen.extensions import db, limiter
 from lumen.models.api_key import APIKey
 from lumen.models.entity import Entity
+from lumen.models.entity_balance import EntityBalance
 from lumen.models.model_config import ModelConfig
 from lumen.models.model_endpoint import ModelEndpoint
 from lumen.models.request_log import RequestLog
@@ -296,6 +297,16 @@ def api_key_required(f):
 @api_key_required
 def get_usage():
     key = g.api_key
+    pool = get_pool_limit(g.entity.id)
+    if pool is None:
+        coins_available = None
+    elif pool[0] == -2:
+        coins_available = -2
+    else:
+        balance = db.session.execute(
+            select(EntityBalance).filter_by(entity_id=g.entity.id)
+        ).scalar_one_or_none()
+        coins_available = float(balance.coins_left) if balance else float(pool[2])
     return jsonify({
         "requests": key.requests,
         "input_tokens": key.input_tokens,
@@ -303,6 +314,7 @@ def get_usage():
         "total_tokens": key.input_tokens + key.output_tokens,
         "audio_seconds": key.audio_seconds,
         "cost": float(key.cost),
+        "coins_available": coins_available,
         "last_used_at": key.last_used_at.isoformat() + "Z" if key.last_used_at else None,
     })
 
