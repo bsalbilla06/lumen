@@ -455,3 +455,7 @@ api:
     token: "a-long-random-string"   # optional; Bearer token auth for /metrics
     multiproc_dir: "/tmp/prom"      # required for multi-worker aggregation (mount as shared volume)
 ```
+
+## License
+
+Lumen is licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.
