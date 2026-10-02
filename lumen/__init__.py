@@ -147,6 +147,15 @@ def _startup_db_hint(e: Exception) -> str:
     return str(e)
 
 
+def compact_number(n) -> str:
+    """Format a count for display: full number below a million, else "3.2 million" / "16.1 billion"."""
+    n = n or 0
+    for size, word in ((1_000_000_000_000, "trillion"), (1_000_000_000, "billion"), (1_000_000, "million")):
+        if abs(n) >= size:
+            return f"{n / size:,.1f} {word}"
+    return f"{n:,}"
+
+
 def create_app():
     app = Flask(__name__)
     app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
@@ -667,6 +676,7 @@ def create_app():
         return Markup(_md.convert(text or ""))
 
     app.jinja_env.filters["markdown"] = _md_filter
+    app.jinja_env.filters["compact_number"] = compact_number
 
     # Sync models from yaml on every startup. group_rules is never read from
     # config.yaml: auto-join rules are database rows managed on each group's

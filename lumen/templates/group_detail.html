@@ -62,7 +62,7 @@
             <div class="profile-stat-card p-3 rounded border h-100">
               <div class="text-muted small mb-1">Tokens Used</div>
               {% if show_members %}
-              <div class="fw-bold fs-5">{{ "{:,}".format(total_tokens) }}</div>
+              <div class="fw-bold fs-5">{{ total_tokens|compact_number }}</div>
               {% else %}
               <div class="fw-bold fs-5 text-muted">—</div>
               {% endif %}

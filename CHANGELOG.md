@@ -15,6 +15,7 @@ All notable changes to Lumen will be documented in this file.
 
 ### Changed
 
+- Request and token totals of a million or more display compactly (e.g. "5.2 million", "16.1 billion").
 - Require an owner when creating a project, with a user search in the owner field.
 - Only admins in admin mode can create groups.
 - **Breaking (Helm chart):** the chart no longer deploys vLLM/SGLang model servers; `models` is copied verbatim into `config.yaml` and uses the config format (snake_case keys, `endpoints` list).

@@ -62,7 +62,7 @@
           <div class="col-4">
             <div class="profile-stat-card p-3 rounded border h-100">
               <div class="text-muted small mb-1">Tokens Used</div>
-              <div class="fw-bold fs-5">{{ "{:,}".format(status.total_tokens_used) }}</div>
+              <div class="fw-bold fs-5">{{ status.total_tokens_used|compact_number }}</div>
             </div>
           </div>
           <!-- Row 2: Favorite Model | Coins Available | Refill Rate -->
