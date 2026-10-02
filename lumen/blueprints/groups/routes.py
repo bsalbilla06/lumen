@@ -463,34 +463,13 @@ def toggle_group(gid):
 
 
 @groups_bp.route("/groups", methods=["POST"])
-@login_required
+@admin_required
 def create_group():
-    """Create a group. Self-service: any logged-in user may create one.
-
-    A non-admin becomes the owner and may set nothing but the name. An admin
-    may additionally name an owner and set the group's coin pool.
-    """
-    entity_id = session["entity_id"]
-    caller = db.session.get(Entity, entity_id)
-    admin = is_admin(caller)
-
+    """Create a group (admin only). The admin may name an owner and set the group's coin pool."""
     data = request.get_json() or request.form
     name = (data.get("name") or "").strip()
     if not name:
         return jsonify({"error": "Group name required"}), HTTPStatus.BAD_REQUEST
-
-    # Present-and-non-blank, not truthy: JSON 0 is a real attempt to set a
-    # coin limit and must be rejected for non-admins, not silently dropped.
-    privileged = [
-        k for k in ("owner_email", "max_coins", "refresh_coins")
-        if data.get(k) not in (None, "")
-    ]
-    if data.get("auto_join") or data.get("rules"):
-        privileged.append("auto_join")
-    if privileged and not admin:
-        return jsonify(
-            {"error": "Only administrators can set an owner, coin limits, or auto-join rules"}
-        ), HTTPStatus.FORBIDDEN
 
     auto_join = bool(data.get("auto_join"))
     rules, error = _parse_rules(data.get("rules") or [])
@@ -508,16 +487,13 @@ def create_group():
         return jsonify({"error": "A group with this name already exists"}), HTTPStatus.CONFLICT
 
     owner_user = None
-    if admin:
-        owner_email = (data.get("owner_email") or "").strip()
-        if owner_email:
-            owner_user = db.session.execute(
-                select(Entity).filter_by(email=owner_email, entity_type="user")
-            ).scalar_one_or_none()
-            if not owner_user:
-                return jsonify({"error": "Owner user not found"}), HTTPStatus.NOT_FOUND
-    else:
-        owner_user = caller
+    owner_email = (data.get("owner_email") or "").strip()
+    if owner_email:
+        owner_user = db.session.execute(
+            select(Entity).filter_by(email=owner_email, entity_type="user")
+        ).scalar_one_or_none()
+        if not owner_user:
+            return jsonify({"error": "Owner user not found"}), HTTPStatus.NOT_FOUND
 
     group = Group(
         name=name,
@@ -535,11 +511,10 @@ def create_group():
         if owner_user:
             db.session.add(GroupMember(group_id=group.id, entity_id=owner_user.id, is_owner=True))
 
-        if admin:
-            error = apply_group_coin_pool_edit(group.id, data)
-            if error:
-                db.session.rollback()
-                return jsonify({"error": error}), HTTPStatus.BAD_REQUEST
+        error = apply_group_coin_pool_edit(group.id, data)
+        if error:
+            db.session.rollback()
+            return jsonify({"error": error}), HTTPStatus.BAD_REQUEST
 
         db.session.commit()
     except IntegrityError:

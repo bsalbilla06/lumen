@@ -119,6 +119,17 @@ def test_index_requires_login(client):
 def test_index_renders_for_plain_user(auth_client):
     resp = auth_client.get("/groups")
     assert resp.status_code == HTTPStatus.OK
+    assert b"New Group" not in resp.data
+
+
+def test_index_hides_new_group_without_admin_mode(admin_client_no_mode):
+    resp = admin_client_no_mode.get("/groups")
+    assert resp.status_code == HTTPStatus.OK
+    assert b"New Group" not in resp.data
+
+
+def test_index_shows_new_group_for_admin(admin_client):
+    resp = admin_client.get("/groups")
     assert b"New Group" in resp.data
 
 
@@ -329,37 +340,33 @@ def test_detail_shows_rules_tab_to_admin(admin_client, config_group):
 # Create
 # ---------------------------------------------------------------------------
 
-def test_create_requires_name(auth_client):
-    resp = auth_client.post("/groups", json={"name": "  "})
+def test_create_requires_name(admin_client):
+    resp = admin_client.post("/groups", json={"name": "  "})
     assert resp.status_code == HTTPStatus.BAD_REQUEST
 
 
-def test_create_by_non_admin_makes_creator_owner(auth_client, app, test_user):
-    resp = auth_client.post("/groups", json={"name": "my-lab"})
-    assert resp.status_code == HTTPStatus.CREATED
-    gid = resp.get_json()["id"]
+def test_create_by_non_admin_forbidden(auth_client, app):
+    resp = auth_client.post("/groups", json={"name": "my-lab"}, headers={"Accept": "application/json"})
+    assert resp.status_code == HTTPStatus.FORBIDDEN
     with app.app_context():
-        from lumen.models.group_member import get_group_owner
-        assert get_group_owner(gid).id == test_user["id"]
+        from lumen.extensions import db
+        from lumen.models.group import Group
+        from sqlalchemy import select
+        assert db.session.execute(select(Group).filter_by(name="my-lab")).scalar_one_or_none() is None
 
 
-def test_create_by_non_admin_rejects_owner_email(auth_client, second_user):
-    resp = auth_client.post("/groups", json={"name": "x", "owner_email": second_user["email"]})
+def test_create_by_admin_without_admin_mode_forbidden(admin_client_no_mode):
+    resp = admin_client_no_mode.post("/groups", json={"name": "my-lab"}, headers={"Accept": "application/json"})
     assert resp.status_code == HTTPStatus.FORBIDDEN
 
 
-def test_create_by_non_admin_rejects_coins(auth_client):
-    resp = auth_client.post("/groups", json={"name": "x", "max_coins": "10"})
-    assert resp.status_code == HTTPStatus.FORBIDDEN
-
-
-def test_create_by_non_admin_makes_no_limit_row(auth_client, app):
-    gid = auth_client.post("/groups", json={"name": "no-pool"}).get_json()["id"]
+def test_admin_create_without_coins_makes_no_limit_row(admin_client, app):
+    gid = admin_client.post("/groups", json={"name": "no-pool"}).get_json()["id"]
     assert _group_limit(app, gid) is None
 
 
-def test_create_duplicate_name_conflicts(auth_client, owned_group):
-    resp = auth_client.post("/groups", json={"name": "owned-group"})
+def test_create_duplicate_name_conflicts(admin_client, owned_group):
+    resp = admin_client.post("/groups", json={"name": "owned-group"})
     assert resp.status_code == HTTPStatus.CONFLICT
 
 
@@ -1031,12 +1038,6 @@ def test_promoting_config_managed_member_clears_flag(auth_client, app, owned_gro
         assert assoc.config_managed is False
 
 
-def test_create_rejects_numeric_zero_coins_from_non_admin(auth_client):
-    """JSON 0 is falsy but is still an attempt to set a coin limit."""
-    resp = auth_client.post("/groups", json={"name": "zero-coins", "max_coins": 0})
-    assert resp.status_code == HTTPStatus.FORBIDDEN
-
-
 def test_add_inactive_member_rejected(auth_client, app, owned_group):
     with app.app_context():
         from lumen.extensions import db
@@ -1206,14 +1207,6 @@ def test_admin_create_auto_join_without_rules_rejected(admin_client):
     assert "at least one rule" in resp.get_json()["error"]
 
 
-def test_non_admin_create_with_auto_join_rejected(auth_client):
-    resp = auth_client.post("/groups", json={
-        "name": "sneaky", "auto_join": True,
-        "rules": [{"field": "idp", "match": "equals", "value": "x"}],
-    })
-    assert resp.status_code == HTTPStatus.FORBIDDEN
-
-
 def test_rules_created_via_api_assign_members_at_login(admin_client, app, second_user):
     """End to end: a rule saved through the UI endpoint really assigns at login."""
     gid = admin_client.post("/groups", json={
@@ -1261,14 +1254,14 @@ def _shadow_session_method(name, exc):
     return _cm()
 
 
-def test_create_group_lost_name_race_returns_409(auth_client):
+def test_create_group_lost_name_race_returns_409(admin_client):
     """The duplicate-name SELECT can lose a race with a concurrent insert; the
     unique constraint then raises IntegrityError, which must map to 409."""
     from sqlalchemy.exc import IntegrityError
 
     exc = IntegrityError("INSERT INTO groups", {}, Exception("UNIQUE constraint failed: groups.name"))
     with _shadow_session_method("flush", exc):
-        resp = auth_client.post("/groups", json={"name": "raced"})
+        resp = admin_client.post("/groups", json={"name": "raced"})
     assert resp.status_code == HTTPStatus.CONFLICT
     assert "already exists" in resp.get_json()["error"]
 

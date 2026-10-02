@@ -5,10 +5,12 @@
 {% block content %}
 <div class="d-flex justify-content-between align-items-center mb-3">
   <h1 class="mb-0">Groups</h1>
+  {% if is_admin %}
   <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#createGroupModal"
           aria-haspopup="dialog">
     + New Group
   </button>
+  {% endif %}
 </div>
 <ilw-content>
 
@@ -100,7 +102,8 @@
   <div id="group-pagination" class="d-flex gap-1 flex-wrap"></div>
 </div>
 
-<!-- Create Group Modal (available to every signed-in user) -->
+{% if is_admin %}
+<!-- Create Group Modal (admins) -->
 <div class="modal fade" id="createGroupModal" tabindex="-1" aria-labelledby="createGroupModalLabel">
   <div class="modal-dialog">
     <div class="modal-content">
@@ -117,7 +120,6 @@
           <label for="group-description-input" class="form-label">Description (optional)</label>
           <input type="text" id="group-description-input" class="form-control" placeholder="What this group is for">
         </div>
-        {% if is_admin %}
         <div class="mb-3 position-relative">
           <label for="group-owner-input" class="form-label">Owner (optional)</label>
           <input type="text" id="group-owner-input" class="form-control" placeholder="Search by name or email…"
@@ -144,9 +146,6 @@
           <div id="create-rules-rows" class="vstack gap-2 mb-2"></div>
           <button type="button" class="btn btn-sm btn-outline-secondary mb-2" id="create-add-rule-btn">+ Add Rule</button>
         </div>
-        {% else %}
-        <p class="text-muted small mb-0">You will be the owner of this group.</p>
-        {% endif %}
         <div id="create-group-error" class="text-danger small" role="alert" aria-live="assertive" hidden></div>
       </div>
       <div class="modal-footer">
@@ -156,6 +155,7 @@
     </div>
   </div>
 </div>
+{% endif %}
 
 <!-- Edit Group Modal (opened from a row's pencil button; owner or admin) -->
 <div class="modal fade" id="editGroupModal" tabindex="-1" aria-labelledby="editGroupModalLabel">
@@ -455,51 +455,50 @@
     errEl.hidden = false;
   });
 
-  // ── Create group modal (everyone) ───────────────────────────────────────
+  {% if is_admin %}
+  // ── Create group modal (admins) ─────────────────────────────────────────
   const createModalEl = document.getElementById('createGroupModal');
   createModalEl.addEventListener('shown.bs.modal', () => document.getElementById('group-name-input').focus());
 
-  if (IS_ADMIN) {
-    initUserSearch({ inputId: 'group-owner-input', listId: 'group-owner-suggestions', searchUrl: '/admin/api/users/search?q=' });
+  initUserSearch({ inputId: 'group-owner-input', listId: 'group-owner-suggestions', searchUrl: '/admin/api/users/search?q=' });
 
-    const rulesWrap = document.getElementById('create-rules-wrap');
-    const rulesRows = document.getElementById('create-rules-rows');
-    const autoCb = document.getElementById('group-auto-input');
-    function addRuleRow() {
-      const idx = 'c' + Math.random().toString(36).slice(2, 8);
-      const div = document.createElement('div');
-      div.className = 'd-flex gap-2 align-items-center rule-row';
-      div.innerHTML = `
-        <label class="visually-hidden" for="rule-field-${idx}">Field</label>
-        <input type="text" id="rule-field-${idx}" class="form-control form-control-sm rule-field" placeholder="field (e.g. affiliation)">
-        <label class="visually-hidden" for="rule-match-${idx}">Match type</label>
-        <select id="rule-match-${idx}" class="form-select form-select-sm rule-match" style="width:auto">
-          <option value="contains">contains</option>
-          <option value="equals">equals</option>
-        </select>
-        <label class="visually-hidden" for="rule-value-${idx}">Value</label>
-        <input type="text" id="rule-value-${idx}" class="form-control form-control-sm rule-value" placeholder="value">
-        <button type="button" class="btn btn-sm btn-outline-danger rule-remove" aria-label="Remove rule"><i class="bi bi-trash" aria-hidden="true"></i></button>`;
-      rulesRows.appendChild(div);
-    }
-    autoCb.addEventListener('change', () => {
-      rulesWrap.hidden = !autoCb.checked;
-      if (autoCb.checked && !rulesRows.children.length) addRuleRow();
-      // An auto-join group cannot have an owner: membership is rule-driven.
-      const ownerEl = document.getElementById('group-owner-input');
-      ownerEl.disabled = autoCb.checked;
-      if (autoCb.checked) ownerEl.value = '';
-    });
-    document.getElementById('create-add-rule-btn').addEventListener('click', addRuleRow);
-    rulesRows.addEventListener('click', e => {
-      const btn = e.target.closest('.rule-remove');
-      if (btn) {
-        btn.closest('.rule-row').remove();
-        // The focused button just vanished; land focus somewhere sensible.
-        document.getElementById('create-add-rule-btn').focus();
-      }
-    });
+  const rulesWrap = document.getElementById('create-rules-wrap');
+  const rulesRows = document.getElementById('create-rules-rows');
+  const autoCb = document.getElementById('group-auto-input');
+  function addRuleRow() {
+    const idx = 'c' + Math.random().toString(36).slice(2, 8);
+    const div = document.createElement('div');
+    div.className = 'd-flex gap-2 align-items-center rule-row';
+    div.innerHTML = `
+      <label class="visually-hidden" for="rule-field-${idx}">Field</label>
+      <input type="text" id="rule-field-${idx}" class="form-control form-control-sm rule-field" placeholder="field (e.g. affiliation)">
+      <label class="visually-hidden" for="rule-match-${idx}">Match type</label>
+      <select id="rule-match-${idx}" class="form-select form-select-sm rule-match" style="width:auto">
+        <option value="contains">contains</option>
+        <option value="equals">equals</option>
+      </select>
+      <label class="visually-hidden" for="rule-value-${idx}">Value</label>
+      <input type="text" id="rule-value-${idx}" class="form-control form-control-sm rule-value" placeholder="value">
+      <button type="button" class="btn btn-sm btn-outline-danger rule-remove" aria-label="Remove rule"><i class="bi bi-trash" aria-hidden="true"></i></button>`;
+    rulesRows.appendChild(div);
   }
+  autoCb.addEventListener('change', () => {
+    rulesWrap.hidden = !autoCb.checked;
+    if (autoCb.checked && !rulesRows.children.length) addRuleRow();
+    // An auto-join group cannot have an owner: membership is rule-driven.
+    const ownerEl = document.getElementById('group-owner-input');
+    ownerEl.disabled = autoCb.checked;
+    if (autoCb.checked) ownerEl.value = '';
+  });
+  document.getElementById('create-add-rule-btn').addEventListener('click', addRuleRow);
+  rulesRows.addEventListener('click', e => {
+    const btn = e.target.closest('.rule-remove');
+    if (btn) {
+      btn.closest('.rule-row').remove();
+      // The focused button just vanished; land focus somewhere sensible.
+      document.getElementById('create-add-rule-btn').focus();
+    }
+  });
 
   document.getElementById('create-group-btn').addEventListener('click', async () => {
     const errEl = document.getElementById('create-group-error');
@@ -511,29 +510,27 @@
       return;
     }
     const body = { name, description: document.getElementById('group-description-input').value.trim() };
-    if (IS_ADMIN) {
-      const ownerEmail = document.getElementById('group-owner-input').value.trim();
-      if (ownerEmail) body.owner_email = ownerEmail;
-      const maxVal = document.getElementById('group-max-input').value;
-      if (maxVal !== '') {
-        body.max_coins = maxVal;
-        body.refresh_coins = document.getElementById('group-refresh-input').value;
+    const ownerEmail = document.getElementById('group-owner-input').value.trim();
+    if (ownerEmail) body.owner_email = ownerEmail;
+    const maxVal = document.getElementById('group-max-input').value;
+    if (maxVal !== '') {
+      body.max_coins = maxVal;
+      body.refresh_coins = document.getElementById('group-refresh-input').value;
+    }
+    const autoJoin = document.getElementById('group-auto-input').checked;
+    if (autoJoin) {
+      const rules = [...document.querySelectorAll('#create-rules-rows .rule-row')].map(row => ({
+        field: row.querySelector('.rule-field').value.trim(),
+        match: row.querySelector('.rule-match').value,
+        value: row.querySelector('.rule-value').value.trim(),
+      })).filter(r => r.field || r.value);
+      if (!rules.length) {
+        errEl.textContent = 'Auto-join requires at least one rule.';
+        errEl.hidden = false;
+        return;
       }
-      const autoJoin = document.getElementById('group-auto-input').checked;
-      if (autoJoin) {
-        const rules = [...document.querySelectorAll('#create-rules-rows .rule-row')].map(row => ({
-          field: row.querySelector('.rule-field').value.trim(),
-          match: row.querySelector('.rule-match').value,
-          value: row.querySelector('.rule-value').value.trim(),
-        })).filter(r => r.field || r.value);
-        if (!rules.length) {
-          errEl.textContent = 'Auto-join requires at least one rule.';
-          errEl.hidden = false;
-          return;
-        }
-        body.auto_join = true;
-        body.rules = rules;
-      }
+      body.auto_join = true;
+      body.rules = rules;
     }
     const resp = await fetch('/groups', {
       method: 'POST',
@@ -549,6 +546,7 @@
     errEl.textContent = data.error || 'Failed to create group.';
     errEl.hidden = false;
   });
+  {% endif %}
 
   fetchGroups();
 })();

@@ -11,6 +11,11 @@ A **group** bundles members together so that policy can be applied once instead 
 - **Coin policy.** A group can carry a coin budget (Max Coins and a Refill Rate). Every member inherits it unless they have a budget of their own. The group does not hold a shared balance — each member gets their own balance governed by the group's policy.
 - **Model access.** A model with an owner is private to that owner. Granting it to a group opens it to every member of the group. This is how you share a model you own with a team.
 
+Groups are primarily used to set up coin distribution. In practice there are two kinds:
+
+- **Auto-join groups** that you are placed in automatically when you log in, based on your login claims (for example your affiliation). These give everyone from the same place the same coin policy.
+- **Groups created by administrators** to raise the coin limits of specific users, for example a research team that needs more usage than the default.
+
 Members can be **users** or **projects**. A project is its own identity for API traffic, so a project member inherits the group's models and coin policy for requests made with the project's API keys.
 
 ## Who Can See What
@@ -20,7 +25,7 @@ Members can be **users** or **projects**. A project is its own identity for API 
 | **Admin** | All groups in the system, including members and usage for every group |
 | **Member** | Only groups they belong to |
 
-Anyone signed in can create a group, so the Groups page is always available.
+The Groups page is always available to signed-in users, but only administrators (in admin mode) can create groups.
 
 ### Groups with no owner
 
@@ -72,12 +77,11 @@ A group can **auto-join** members: administrators define rules on the group's Ru
 
 ## Creating a Group
 
-Anyone can create a group:
+Only administrators with admin mode enabled can create groups; the **+ New Group** button is hidden for everyone else.
 
 1. Click **+ New Group**.
 2. Enter a name, and optionally a description.
-3. Click **Create**.
+3. Optionally pick an **Owner** (leave it blank for a group with no owner) and set **Max Coins** / **Refill Rate** for the group's coin policy.
+4. Click **Create**.
 
-You become the owner of the group and are redirected to its detail page.
-
-Administrators see extra fields in the dialog: an **Owner** search box (leave it blank for a group with no owner) and **Max Coins** / **Refill Rate** for the group's coin policy. Non-admins cannot set an owner or a coin policy — an admin has to add the coin policy afterwards.
+You are redirected to the new group's detail page.
