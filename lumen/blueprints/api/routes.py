@@ -300,7 +300,7 @@ def get_usage():
     pool = get_pool_limit(g.entity.id)
     if pool is None:
         coins_available = None
-    elif pool[0] == -2:
+    elif pool.max_coins == -2:
         coins_available = -2
     else:
         balance = db.session.execute(
