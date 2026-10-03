@@ -36,7 +36,8 @@ curl https://lumen.example.com/v1/usage \
 ```
 
 Returns cumulative usage for the **specific key** in the Authorization header, including requests,
-input and output tokens, their total, audio seconds, coins spent (`cost`), and the UTC time the key was last used:
+input and output tokens, their total, audio seconds, coins spent (`cost`), coins still available
+(`coins_available`), and the UTC time the key was last used:
 
 ```json
 {
@@ -46,13 +47,16 @@ input and output tokens, their total, audio seconds, coins spent (`cost`), and t
   "total_tokens": 3000,
   "audio_seconds": 0,
   "cost": 0.012345,
+  "coins_available": 83.25,
   "last_used_at": "2026-09-28T14:00:00Z"
 }
 ```
 
-`last_used_at` is `null` for a key that has never been used. This endpoint does not add to the
-request count. It does not include usage from other keys, browser chat, or earlier periods before
-the key was created.
+`last_used_at` is `null` for a key that has never been used. `coins_available` is the coin balance
+of the account that owns the key, so it is shared with that account's other keys and browser chat;
+`-2` means the account has an unlimited coin pool and `null` that no pool is configured or that
+the account is disabled. This endpoint does not add to the request count. It does not include
+usage from other keys, browser chat, or earlier periods before the key was created.
 
 ---
 
