@@ -290,7 +290,8 @@ def test_sync_no_aliases_flag(home, lumen_server):
 def test_sync_writes_capability_flags(home, lumen_server):
     """Capability fields from /v1/models land in the config as OpenCode's
     modalities/attachment/tool_call/reasoning flags; models without the data
-    get no capability keys at all (issue #79)."""
+    get only tool_call: false, since OpenCode assumes tool calling unless
+    told false (issue #79)."""
     port = lumen_server.server_address[1]
     keys = home / ".config" / "lumen" / "keys.json"
     keys.parent.mkdir(parents=True)
@@ -308,7 +309,7 @@ def test_sync_writes_capability_flags(home, lumen_server):
     alias = models["gpt-alias"]
     assert alias["modalities"] == {"output": ["text"]}
     assert "attachment" not in alias
-    assert "tool_call" not in alias
+    assert alias["tool_call"] is False
     assert "reasoning" not in alias
 
 

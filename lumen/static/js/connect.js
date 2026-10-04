@@ -79,8 +79,9 @@
         entry.cost = { input: m.input_cost_per_million, output: m.output_cost_per_million };
         // Capability fields (issue #79). OpenCode derives image support from
         // modalities.input — attachment alone does not gate image requests —
-        // and reads tool_call (underscored) for function calling. Omit
-        // anything unknown rather than guessing a default.
+        // and reads tool_call (underscored) for function calling. Unknown
+        // fields stay omitted, except tool_call: OpenCode assumes tool
+        // calling unless the config says false, so it is always written.
         if ((m.input_modalities && m.input_modalities.length) ||
             (m.output_modalities && m.output_modalities.length)) {
           entry.modalities = {};
@@ -88,7 +89,7 @@
           if (m.output_modalities && m.output_modalities.length) entry.modalities.output = m.output_modalities;
         }
         if (m.input_modalities && m.input_modalities.includes("image")) entry.attachment = true;
-        if (m.supports_function_calling === true) entry.tool_call = true;
+        entry.tool_call = m.supports_function_calling === true;
         if (m.supports_reasoning === true) entry.reasoning = true;
         models[m.id] = entry;
       });
