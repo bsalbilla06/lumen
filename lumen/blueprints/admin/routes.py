@@ -5,8 +5,15 @@ from http import HTTPStatus
 import yaml
 from flask import Blueprint, current_app, jsonify, redirect, render_template, request, session, url_for
 from sqlalchemy import case, delete, func, select, update
+from sqlalchemy.exc import IntegrityError
 
-from lumen.blueprints.profile.routes import _entity_groups, _get_profile_data, _gravatar_url
+from lumen.blueprints.profile.routes import (
+    _all_groups_for_picker,
+    _entity_groups,
+    _get_profile_data,
+    _gravatar_url,
+    _memberships_by_entity,
+)
 from lumen.commands import write_config_yaml
 from lumen.decorators import admin_required
 from lumen.extensions import db
@@ -268,6 +275,7 @@ def users():
         total_requests=int(total_requests),
         total_tokens=int(total_tokens),
         total_cost=float(total_cost),
+        all_groups=_all_groups_for_picker(),
     )
 
 
@@ -280,18 +288,82 @@ def toggle_user(eid):
     return jsonify({"active": entity.active})
 
 
+def _parse_group_ids(raw, key):
+    """Validate a list of group ids from the edit payload; returns (ids, error)."""
+    if raw is None:
+        return set(), None
+    if not isinstance(raw, list) or not all(isinstance(g, int) and not isinstance(g, bool) for g in raw):
+        return None, f"{key} must be a list of group ids"
+    return set(raw), None
+
+
+def apply_group_membership_edit(entity_id, data):
+    """Apply add_group_ids/remove_group_ids from the Edit User dialog.
+
+    Only the groups the admin touched change, so memberships added or removed
+    elsewhere since the dialog loaded are left alone. Adding an existing
+    membership or removing a missing one is a no-op. Memberships of auto-join
+    groups are rule-driven and cannot be added or removed by hand, and the
+    owner of a group cannot be removed. Returns (error, HTTPStatus) or
+    (None, None) on success (caller commits).
+    """
+    add_ids, error = _parse_group_ids(data.get("add_group_ids"), "add_group_ids")
+    if error:
+        return error, HTTPStatus.BAD_REQUEST
+    remove_ids, error = _parse_group_ids(data.get("remove_group_ids"), "remove_group_ids")
+    if error:
+        return error, HTTPStatus.BAD_REQUEST
+    if add_ids & remove_ids:
+        return "A group cannot be both added and removed", HTTPStatus.BAD_REQUEST
+    touched = add_ids | remove_ids
+    if not touched:
+        return None, None
+    groups = {
+        g.id: g for g in db.session.execute(select(Group).where(Group.id.in_(touched))).scalars().all()
+    }
+    if len(groups) != len(touched):
+        return "Unknown group id", HTTPStatus.BAD_REQUEST
+    for gid in touched:
+        if groups[gid].auto_join:
+            return (f"Membership of {groups[gid].name} is managed by its auto-join rules",
+                    HTTPStatus.CONFLICT)
+    current = {
+        m.group_id: m for m in db.session.execute(
+            select(GroupMember).where(GroupMember.entity_id == entity_id, GroupMember.group_id.in_(touched))
+        ).scalars().all()
+    }
+    for gid in add_ids - current.keys():
+        db.session.add(GroupMember(group_id=gid, entity_id=entity_id))
+    for gid in remove_ids & current.keys():
+        member = current[gid]
+        if member.is_owner:
+            return (f"Transfer ownership of {groups[gid].name} before removing the owner",
+                    HTTPStatus.CONFLICT)
+        db.session.delete(member)
+    return None, None
+
+
 @admin_bp.route("/users/<int:eid>", methods=["PATCH"])
 @admin_required
 def update_user(eid):
-    """Edit a user's active flag and coin pool from the profile Edit dialog."""
+    """Edit a user's active flag, coin pool and groups from the Edit User dialog."""
     entity = db.first_or_404(select(Entity).filter_by(id=eid, entity_type="user"))
     data = request.get_json() or {}
     error = apply_coin_pool_edit(eid, data)
     if error:
         return jsonify({"error": error}), HTTPStatus.BAD_REQUEST
+    error, status = apply_group_membership_edit(eid, data)
+    if error:
+        db.session.rollback()
+        return jsonify({"error": error}), status
     if "active" in data:
         entity.active = bool(data["active"])
-    db.session.commit()
+    try:
+        db.session.commit()
+    except IntegrityError:
+        # A concurrent add of the same membership trips UNIQUE(group_id, entity_id).
+        db.session.rollback()
+        return jsonify({"error": "Group membership changed concurrently; reload and retry"}), HTTPStatus.CONFLICT
     return jsonify({"ok": True, "active": entity.active})
 
 
@@ -339,6 +411,8 @@ def user_profile(eid):
         gravatar_url=_gravatar_url(entity.email, size=230),
         profile_groups=_entity_groups(eid),
         user_limit=user_limit,
+        all_groups=_all_groups_for_picker(),
+        user_memberships=_memberships_by_entity([eid]).get(eid, []),
     )
 
 
@@ -418,6 +492,7 @@ def api_users():
             select(EntityLimit).where(EntityLimit.entity_id.in_(page_ids))
         ).scalars().all()
     } if page_ids else {}
+    memberships = _memberships_by_entity(page_ids)
 
     return jsonify({
         "users": [
@@ -427,6 +502,7 @@ def api_users():
                 "active": entity.active,
                 "max_coins": float(limits[entity.id].max_coins) if entity.id in limits else None,
                 "refresh_coins": float(limits[entity.id].refresh_coins) if entity.id in limits else None,
+                "groups": memberships.get(entity.id, []),
                 "joined": entity.created_at.strftime("%Y-%m-%dT%H:%M:%SZ") if entity.created_at else None,
                 "last_used": last_used_at.strftime("%Y-%m-%dT%H:%M:%SZ") if last_used_at else None,
                 "requests": int(requests),

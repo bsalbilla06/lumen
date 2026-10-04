@@ -96,6 +96,7 @@
           <input class="form-check-input" type="checkbox" role="switch" id="edit-user-active">
           <label class="form-check-label" for="edit-user-active">Active</label>
         </div>
+        {% include '_edit_user_groups_field.html' %}
         <div class="mb-3">
           <label class="form-label" for="edit-user-max">Max Coins</label>
           <input type="number" id="edit-user-max" class="form-control" step="0.01">
@@ -128,6 +129,7 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="{{ url_for('static', filename='js/group-pills.js') }}"></script>
 <script>
 (function () {
   const params = new URLSearchParams(location.search);
@@ -319,12 +321,17 @@
   const editModalEl = document.getElementById('editUserModal');
   const editModal = new bootstrap.Modal(editModalEl);
   editModalEl.addEventListener('shown.bs.modal', () => document.getElementById('edit-user-active').focus());
+  const groupPills = initGroupPills({
+    boxId: 'edit-user-groups-box', pillsId: 'edit-user-groups-pills', inputId: 'edit-user-groups',
+    listId: 'edit-user-groups-list', liveId: 'edit-user-groups-live', allGroups: {{ all_groups|tojson }},
+  });
 
   function openEditModal(u) {
     editingId = u.id;
     document.getElementById('edit-user-active').checked = u.active;
     document.getElementById('edit-user-max').value = u.max_coins === null ? '' : u.max_coins.toFixed(2);
     document.getElementById('edit-user-refresh').value = u.refresh_coins === null ? '' : u.refresh_coins.toFixed(2);
+    groupPills.set(u.groups);
     document.getElementById('edit-user-error').hidden = true;
     editModal.show();
   }
@@ -337,6 +344,7 @@
       active: document.getElementById('edit-user-active').checked,
       max_coins: document.getElementById('edit-user-max').value,
       refresh_coins: document.getElementById('edit-user-refresh').value,
+      ...groupPills.changes(),
     };
     const resp = await fetch('/admin/users/' + editingId, {
       method: 'PATCH',

@@ -22,12 +22,12 @@ The right side shows six stat tiles:
 | **Coins Used** | Total coins spent across all models, all time |
 | **Tokens Used** | All input + output tokens across all models, all time |
 | **Favorite Model** | The model you have used most |
-| **Coins Available** | Your current pool balance with a progress bar (when a limit is set) |
+| **Coins Available** | Your current pool balance with a progress bar (when a limit is set). Admins also get a reset button (↺) that refills the balance to its starting coins |
 | **Refill Rate** | Auto-refill rate per hour and a countdown to the next refill |
 
 ### Editing a User (admins)
 
-Admins in admin mode see an **Edit** button above the stat tiles — on their own profile and when viewing another user's profile from the admin Users page. It opens a dialog to enable/disable the account (**Active**) and set the user's coin pool: **Max Coins** (`-2` = unlimited, `0` = blocked) and **Refill Rate** (coins added per hour). Clearing Max Coins removes the user's own pool so it falls back to their groups or the global defaults; lowering Max Coins clamps the current balance. A user's name cannot be edited here — it comes from the login provider.
+Admins in admin mode see an **Edit** button above the stat tiles — on their own profile and when viewing another user's profile from the admin Users page. It opens a dialog to enable/disable the account (**Active**), add or remove the user's **Groups** (see [User Groups and Access Control](../admin/config-users.md#everything-else-lives-in-the-database)), and set the user's coin pool: **Max Coins** (`-2` = unlimited, `0` = blocked) and **Refill Rate** (coins added per hour). Clearing Max Coins removes the user's own pool so it falls back to their groups or the global defaults; lowering Max Coins clamps the current balance. A user's name cannot be edited here — it comes from the login provider.
 
 ### Coin Pool Values
 

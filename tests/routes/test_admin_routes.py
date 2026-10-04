@@ -983,3 +983,175 @@ models:
         assert yaml.safe_load(cfg.read_text())["models"][0]["aliases"] == ["glm-5.2"]
     finally:
         app.config["CONFIG_YAML"] = original
+
+
+def _make_groups(app, user_id, specs):
+    """Create groups from (name, auto_join, member, is_owner, config_managed) tuples; return {name: id}."""
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.group import Group
+        from lumen.models.group_member import GroupMember
+        ids = {}
+        for name, auto_join, member, is_owner, config_managed in specs:
+            group = Group(name=name, active=True, auto_join=auto_join)
+            db.session.add(group)
+            db.session.flush()
+            if member:
+                db.session.add(GroupMember(
+                    group_id=group.id, entity_id=user_id, is_owner=is_owner, config_managed=config_managed,
+                ))
+            ids[name] = group.id
+        db.session.commit()
+        return ids
+
+
+def _member_group_ids(app, user_id):
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.group_member import GroupMember
+        return set(db.session.execute(
+            select(GroupMember.group_id).filter_by(entity_id=user_id)
+        ).scalars().all())
+
+
+def test_update_user_add_and_remove_group_ids(app, admin_client, test_user):
+    ids = _make_groups(app, test_user["id"], [
+        ("keep", False, True, False, False),
+        ("drop", False, True, False, False),
+        ("join", False, False, False, False),
+    ])
+    resp = admin_client.patch(
+        f"/admin/users/{test_user['id']}",
+        json={"add_group_ids": [ids["join"]], "remove_group_ids": [ids["drop"]]},
+    )
+    assert resp.status_code == HTTPStatus.OK
+    assert _member_group_ids(app, test_user["id"]) == {ids["keep"], ids["join"]}
+
+
+def test_update_user_leaves_untouched_groups_alone(app, admin_client, test_user):
+    # Memberships changed elsewhere after the dialog loaded (including an
+    # auto-join group added at login) are not in the payload and must survive.
+    ids = _make_groups(app, test_user["id"], [
+        ("added-elsewhere", False, True, False, False),
+        ("auto-at-login", True, True, False, True),
+    ])
+    resp = admin_client.patch(f"/admin/users/{test_user['id']}", json={"max_coins": 50})
+    assert resp.status_code == HTTPStatus.OK
+    assert _member_group_ids(app, test_user["id"]) == {ids["added-elsewhere"], ids["auto-at-login"]}
+
+
+def test_update_user_group_changes_are_idempotent(app, admin_client, test_user):
+    # Adding an existing membership or removing a missing one is a no-op.
+    ids = _make_groups(app, test_user["id"], [
+        ("already-in", False, True, False, False),
+        ("already-out", False, False, False, False),
+    ])
+    resp = admin_client.patch(
+        f"/admin/users/{test_user['id']}",
+        json={"add_group_ids": [ids["already-in"]], "remove_group_ids": [ids["already-out"]]},
+    )
+    assert resp.status_code == HTTPStatus.OK
+    assert _member_group_ids(app, test_user["id"]) == {ids["already-in"]}
+
+
+@pytest.mark.parametrize("payload", [
+    {"add_group_ids": [999999]},
+    {"remove_group_ids": [999999]},
+    {"add_group_ids": "1"},
+    {"add_group_ids": [True]},
+    {"remove_group_ids": [1.5]},
+    {"add_group_ids": [1], "remove_group_ids": [1]},
+])
+def test_update_user_group_ids_invalid_returns_400(admin_client, test_user, payload):
+    resp = admin_client.patch(f"/admin/users/{test_user['id']}", json=payload)
+    assert resp.status_code == HTTPStatus.BAD_REQUEST
+
+
+def test_update_user_group_ids_auto_join_returns_409(app, admin_client, test_user):
+    ids = _make_groups(app, test_user["id"], [
+        ("auto-in", True, True, False, True),
+        ("auto-out", True, False, False, False),
+    ])
+    resp = admin_client.patch(f"/admin/users/{test_user['id']}", json={"add_group_ids": [ids["auto-out"]]})
+    assert resp.status_code == HTTPStatus.CONFLICT
+    resp = admin_client.patch(f"/admin/users/{test_user['id']}", json={"remove_group_ids": [ids["auto-in"]]})
+    assert resp.status_code == HTTPStatus.CONFLICT
+    assert _member_group_ids(app, test_user["id"]) == {ids["auto-in"]}
+
+
+def test_update_user_group_ids_owner_removal_returns_409_atomically(app, admin_client, test_user):
+    ids = _make_groups(app, test_user["id"], [("owned", False, True, True, False)])
+    resp = admin_client.patch(
+        f"/admin/users/{test_user['id']}",
+        json={"remove_group_ids": [ids["owned"]], "active": False, "max_coins": 50},
+    )
+    assert resp.status_code == HTTPStatus.CONFLICT
+    assert _member_group_ids(app, test_user["id"]) == {ids["owned"]}
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity import Entity
+        from lumen.models.entity_limit import EntityLimit
+        # Nothing else in the payload was applied.
+        assert db.session.get(Entity, test_user["id"]).active is True
+        assert db.session.execute(
+            select(EntityLimit).filter_by(entity_id=test_user["id"])
+        ).scalar_one_or_none() is None
+
+
+def test_update_user_group_ids_removes_config_managed_membership(app, admin_client, test_user):
+    ids = _make_groups(app, test_user["id"], [("stamped", False, True, False, True)])
+    resp = admin_client.patch(f"/admin/users/{test_user['id']}", json={"remove_group_ids": [ids["stamped"]]})
+    assert resp.status_code == HTTPStatus.OK
+    assert _member_group_ids(app, test_user["id"]) == set()
+
+
+def test_update_user_group_ids_requires_admin(auth_client, test_user):
+    resp = auth_client.patch(f"/admin/users/{test_user['id']}", json={"remove_group_ids": []})
+    assert resp.status_code == HTTPStatus.FORBIDDEN
+
+
+def _set_pool(app, user_id, coins_left):
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity_balance import EntityBalance
+        from lumen.models.entity_limit import EntityLimit
+        db.session.add(EntityLimit(entity_id=user_id, max_coins=100, refresh_coins=0, starting_coins=100))
+        db.session.add(EntityBalance(entity_id=user_id, coins_left=coins_left))
+        db.session.commit()
+
+
+def test_profile_reset_coins_button_shown_to_admin(app, admin_client, test_user):
+    _set_pool(app, test_user["id"], 20)
+    page = admin_client.get(f"/admin/users/{test_user['id']}/profile").get_data(as_text=True)
+    assert 'id="reset-coins-btn"' in page
+    assert f"/admin/users/{test_user['id']}/reset-tokens" in page
+
+
+def test_profile_reset_coins_button_hidden_from_regular_user(app, auth_client, test_user):
+    _set_pool(app, test_user["id"], 20)
+    page = auth_client.get("/profile").get_data(as_text=True)
+    assert 'id="reset-coins-btn"' not in page
+    assert "reset-tokens" not in page
+
+
+def test_profile_reset_coins_button_hidden_for_unlimited_pool(app, admin_client, test_user):
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity_limit import EntityLimit
+        db.session.add(EntityLimit(entity_id=test_user["id"], max_coins=-2, refresh_coins=0, starting_coins=0))
+        db.session.commit()
+    page = admin_client.get(f"/admin/users/{test_user['id']}/profile").get_data(as_text=True)
+    assert 'id="reset-coins-btn"' not in page
+
+
+def test_api_users_includes_groups(app, admin_client, test_user):
+    ids = _make_groups(app, test_user["id"], [
+        ("beta", True, True, False, True),
+        ("alpha", False, True, True, False),
+    ])
+    resp = admin_client.get("/admin/api/users?search=testuser")
+    user = next(u for u in resp.get_json()["users"] if u["id"] == test_user["id"])
+    assert user["groups"] == [
+        {"id": ids["alpha"], "name": "alpha", "auto_join": False, "is_owner": True},
+        {"id": ids["beta"], "name": "beta", "auto_join": True, "is_owner": False},
+    ]

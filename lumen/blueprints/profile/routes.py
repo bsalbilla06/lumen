@@ -43,6 +43,31 @@ def _entity_groups(eid: int) -> list:
     ).scalars().all()
 
 
+def _all_groups_for_picker() -> list[dict]:
+    """Every group, for the Edit User dialog's group picker suggestions."""
+    return [
+        {"id": g.id, "name": g.name, "active": g.active, "auto_join": g.auto_join}
+        for g in db.session.execute(select(Group).order_by(Group.name)).scalars().all()
+    ]
+
+
+def _memberships_by_entity(entity_ids: list[int]) -> dict[int, list[dict]]:
+    """Each entity's groups as picker pills ({id, name, auto_join, is_owner}), keyed by entity id."""
+    result: dict[int, list[dict]] = {}
+    if not entity_ids:
+        return result
+    for eid, g, is_owner in db.session.execute(
+        select(GroupMember.entity_id, Group, GroupMember.is_owner)
+        .join(Group, Group.id == GroupMember.group_id)
+        .where(GroupMember.entity_id.in_(entity_ids))
+        .order_by(Group.name)
+    ).all():
+        result.setdefault(eid, []).append(
+            {"id": g.id, "name": g.name, "auto_join": g.auto_join, "is_owner": is_owner}
+        )
+    return result
+
+
 def _endpoint_status(eps: list) -> str:
     """Map a model's endpoints to a health status: down / degraded / ok."""
     healthy = sum(1 for e in eps if e.healthy)
@@ -249,6 +274,8 @@ def index():
     user_limit = db.session.execute(
         select(EntityLimit).filter_by(entity_id=entity_id)
     ).scalar_one_or_none()
+    # Group picker data for the admin-only Edit User dialog.
+    admin = _is_admin(profile_entity)
     return render_template(
         "profile.html", **data,
         profile_entity=profile_entity,
@@ -257,6 +284,8 @@ def index():
         admin_eligible=is_admin_eligible(profile_entity),
         admin_mode=bool(session.get("admin_mode")),
         user_limit=user_limit,
+        all_groups=_all_groups_for_picker() if admin else [],
+        user_memberships=_memberships_by_entity([entity_id]).get(entity_id, []) if admin else [],
     )
 
 

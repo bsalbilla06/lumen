@@ -80,11 +80,18 @@
               {% elif coin_pool.coin_limit == -2 %}
                 <div class="fw-bold fs-5 text-success">Unlimited</div>
               {% else %}
-                <div class="fw-bold fs-5 mb-2">{{ "%.2f"|format(coin_pool.coins_left) }}{% if coin_pool.coin_limit > 0 %}<span class="text-muted fw-normal fs-6"> / {{ "%.2f"|format(coin_pool.coin_limit) }}</span>{% endif %}</div>
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                  <div class="fw-bold fs-5"><span id="coins-left">{{ "%.2f"|format(coin_pool.coins_left) }}</span>{% if coin_pool.coin_limit > 0 %}<span class="text-muted fw-normal fs-6"> / {{ "%.2f"|format(coin_pool.coin_limit) }}</span>{% endif %}</div>
+                  {% if is_admin %}
+                  <button type="button" id="reset-coins-btn" class="btn btn-sm btn-outline-secondary" title="Reset coins"
+                          aria-label="Reset coins for {{ profile_entity.name }}"><i class="bi bi-arrow-counterclockwise" aria-hidden="true"></i></button>
+                  {% endif %}
+                </div>
+                {% if is_admin %}<div id="reset-coins-status" class="visually-hidden" role="status" aria-live="polite"></div>{% endif %}
                 {% if coin_pool.coin_limit > 0 %}
                 {%- set pct = [(coin_pool.coins_left / coin_pool.coin_limit * 100)|int, 100]|min %}
                 <div class="progress" style="height:8px">
-                  <div class="progress-bar" role="progressbar"
+                  <div class="progress-bar" id="coins-left-bar" role="progressbar"
                        aria-label="Coin pool balance"
                        style="width:{{ pct }}%"
                        aria-valuenow="{{ coin_pool.coins_left }}"
@@ -373,6 +380,7 @@
                  {% if profile_entity.active %}checked{% endif %}>
           <label class="form-check-label" for="edit-user-active">Active</label>
         </div>
+        {% include '_edit_user_groups_field.html' %}
         <div class="mb-3">
           <label class="form-label" for="edit-user-max">Max Coins</label>
           <input type="number" id="edit-user-max" class="form-control" step="0.01"
@@ -416,6 +424,7 @@
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
 <script src="{{ url_for('static', filename='js/ack-consent.js') }}"></script>
+{% if is_admin and profile_entity %}<script src="{{ url_for('static', filename='js/group-pills.js') }}"></script>{% endif %}
 <script>
 const IS_ADMIN_VIEW = {{ (viewing_user is defined and viewing_user is not none) | tojson }};
 
@@ -445,6 +454,14 @@ document.querySelectorAll('#profile-tabs [data-bs-toggle="tab"]').forEach(btn =>
   const editUserModal = document.getElementById("editUserModal");
   const EDIT_USER_ID = {{ profile_entity.id }};
   editUserModal.addEventListener("shown.bs.modal", () => document.getElementById("edit-user-active").focus());
+  const groupPills = initGroupPills({
+    boxId: "edit-user-groups-box", pillsId: "edit-user-groups-pills", inputId: "edit-user-groups",
+    listId: "edit-user-groups-list", liveId: "edit-user-groups-live", allGroups: {{ all_groups|tojson }},
+  });
+  const USER_MEMBERSHIPS = {{ user_memberships|tojson }};
+  groupPills.set(USER_MEMBERSHIPS);
+  // Discard unsaved pill changes when the dialog is dismissed.
+  editUserModal.addEventListener("hidden.bs.modal", () => groupPills.set(USER_MEMBERSHIPS));
   document.getElementById("edit-user-save-btn").addEventListener("click", async () => {
     const errEl = document.getElementById("edit-user-error");
     errEl.hidden = true;
@@ -459,6 +476,7 @@ document.querySelectorAll('#profile-tabs [data-bs-toggle="tab"]').forEach(btn =>
       active,
       max_coins: document.getElementById("edit-user-max").value,
       refresh_coins: document.getElementById("edit-user-refresh").value,
+      ...groupPills.changes(),
     };
     const resp = await fetch("/admin/users/" + EDIT_USER_ID, {
       method: "PATCH",
@@ -469,6 +487,36 @@ document.querySelectorAll('#profile-tabs [data-bs-toggle="tab"]').forEach(btn =>
     const data = await resp.json().catch(() => ({}));
     errEl.textContent = data.error || "Failed to save changes.";
     errEl.hidden = false;
+  });
+}
+{% endif %}
+
+{% if is_admin and profile_entity %}
+// ── Reset coins (admin button on the Coins Available card)
+const resetCoinsBtn = document.getElementById("reset-coins-btn");
+if (resetCoinsBtn) {
+  resetCoinsBtn.addEventListener("click", async () => {
+    const statusEl = document.getElementById("reset-coins-status");
+    resetCoinsBtn.disabled = true;
+    try {
+      const resp = await fetch("/admin/users/{{ profile_entity.id }}/reset-tokens", {
+        method: "POST", headers: { "X-CSRFToken": csrfToken },
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) { appAlert(data.error || "Failed to reset coins."); return; }
+      const coins = parseFloat(data.coins_available);
+      document.getElementById("coins-left").textContent = coins.toFixed(2);
+      const bar = document.getElementById("coins-left-bar");
+      if (bar) {
+        const max = parseFloat(bar.getAttribute("aria-valuemax"));
+        bar.style.width = Math.min(Math.floor(coins / max * 100), 100) + "%";
+        bar.setAttribute("aria-valuenow", coins);
+      }
+      statusEl.textContent = `Coins reset to ${coins.toFixed(2)}`;
+    } finally {
+      resetCoinsBtn.disabled = false;
+      resetCoinsBtn.focus();
+    }
   });
 }
 {% endif %}
