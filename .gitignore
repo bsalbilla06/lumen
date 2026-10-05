@@ -93,7 +93,8 @@ todo-looper.sh
 /todo-looper/
 todo.md
 
-# monitoring
-monitor/
-monitoring/
+# extra tools
+tools/
+
+# deployments
 chart/panama.yaml
