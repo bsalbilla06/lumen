@@ -6,6 +6,7 @@ from http import HTTPStatus
 
 from lumen.extensions import db
 from lumen.models.api_key import APIKey
+from lumen.models.entity_balance import EntityBalance
 from lumen.services.crypto import hash_api_key
 
 
@@ -33,6 +34,7 @@ def test_usage_returns_only_authenticated_keys_cumulative_counters(app, client, 
         "total_tokens": 125,
         "audio_seconds": 42,
         "cost": 1.234567,
+        "coins_available": None,
         "last_used_at": "2026-09-28T14:00:00Z",
     }
     assert client.get("/v1/usage", headers={"Authorization": "Bearer first-token"}).get_json() == response.get_json()
@@ -69,8 +71,35 @@ def test_usage_for_unused_key_has_zero_counters_and_no_last_use(app, client, tes
         "total_tokens": 0,
         "audio_seconds": 0,
         "cost": 0.0,
+        "coins_available": None,
         "last_used_at": None,
     }
+
+
+def test_usage_reports_entity_coin_balance(app, client, test_user, restore_config):
+    """coins_available mirrors the owning entity's pool: balance row, starting
+    coins before first use, -2 for unlimited, null for no pool."""
+
+    def balance_for(token):
+        return client.get("/v1/usage", headers={"Authorization": f"Bearer {token}"}).get_json()["coins_available"]
+
+    app.config["TOKEN_DEFAULTS"] = {"max": 100, "refresh": 10, "starting": 40}
+    with app.app_context():
+        db.session.add(APIKey(
+            entity_id=test_user["id"], name="pooled", key_hash=hash_api_key("pooled-token"),
+        ))
+        db.session.commit()
+
+    assert balance_for("pooled-token") == 40.0  # starting coins before the first request
+
+    with app.app_context():
+        db.session.add(EntityBalance(entity_id=test_user["id"], coins_left=Decimal("17.500000")))
+        db.session.commit()
+
+    assert balance_for("pooled-token") == 17.5
+
+    app.config["TOKEN_DEFAULTS"] = {"max": -2, "refresh": 0, "starting": 0}
+    assert balance_for("pooled-token") == -2
 
 
 def test_usage_rejects_monitor_token(app, client):

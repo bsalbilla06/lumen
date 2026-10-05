@@ -6,7 +6,8 @@ All notable changes to Lumen will be documented in this file.
 
 ### Added
 
-- API keys can retrieve their cumulative usage through `GET /v1/usage`.
+- Show which user created each project API key.
+- API keys can retrieve their cumulative usage through `GET /v1/usage`, including the account's remaining coins.
 - Lumen is now licensed under the Apache License 2.0.
 - OAuth key-request flows: device flow for CLIs and authorization-code + PKCE for web apps mint scoped API keys after a consent page with model acknowledgements and overwrite control. ([#67](https://github.com/ncsa/lumen/issues/67))
 - `lumen.sh` logs in through the device flow, stores keys per server in `~/.config/lumen/keys.json` plus a managed shell rc block (`LUMEN_API_KEY` + `LUMEN_BASE_URL`), and syncs Lumen models into the opencode config by default (`--no-opencode`, `--relogin`). ([#67](https://github.com/ncsa/lumen/issues/67))
@@ -18,6 +19,8 @@ All notable changes to Lumen will be documented in this file.
 ### Changed
 
 - Request and token totals of a million or more display compactly (e.g. "5.2 million", "16.1 billion").
+- Generated opencode configs (`lumen.sh` sync and the Connect page) advertise each model's `modalities`, `attachment`, `tool_call`, and `reasoning` flags, so OpenCode accepts image uploads for vision models instead of rejecting them client-side. ([#79](https://github.com/ncsa/lumen/issues/79))
+- The model dashboard lists each model's accepted inputs (text/image/audio) as pills next to its name. ([#79](https://github.com/ncsa/lumen/issues/79))
 - Require an owner when creating a project, with a user search in the owner field.
 - Only admins in admin mode can create groups.
 - **Breaking (Helm chart):** the chart no longer deploys vLLM/SGLang model servers; `models` is copied verbatim into `config.yaml` and uses the config format (snake_case keys, `endpoints` list).

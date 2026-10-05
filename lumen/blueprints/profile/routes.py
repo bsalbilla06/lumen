@@ -242,7 +242,20 @@ def _build_project_list(eid: int) -> list:
 
 def _get_profile_data(eid: int) -> dict:
     chat_agg, conversation_count = _fetch_chat_stats(eid)
-    api_keys = db.session.execute(select(APIKey).filter_by(entity_id=eid).order_by(APIKey.created_at)).scalars().all()
+    # One query per page view: the creator's name/email rides along via an
+    # outer join instead of a per-key lookup when rendering the key table.
+    key_rows = db.session.execute(
+        select(APIKey, Entity.name.label("creator_name"), Entity.email.label("creator_email"))
+        .outerjoin(Entity, APIKey.created_by_entity_id == Entity.id)
+        .filter(APIKey.entity_id == eid)
+        .order_by(APIKey.created_at)
+    ).all()
+    api_keys = [key for key, _, _ in key_rows]
+    key_creators = {
+        key.id: ("Unknown" if key.created_by_entity_id is None
+                 else creator_name or creator_email or "Unknown")
+        for key, creator_name, creator_email in key_rows
+    }
     # Fetch model context once and build both the usage list and the access list from it.
     all_models, eps_by_model, access_statuses, consent_map = _fetch_model_context(eid)
     model_usage, total_tokens_used, total_cost = _build_model_usage(eid, all_models, eps_by_model, access_statuses)
@@ -254,6 +267,7 @@ def _get_profile_data(eid: int) -> dict:
         "chat_agg": chat_agg,
         "conversation_count": conversation_count,
         "api_keys": api_keys,
+        "key_creators": key_creators,
         "model_usage": model_usage,
         "model_access_list": model_access_list,
         "coin_pool": coin_pool,
@@ -319,6 +333,7 @@ def create_key():
 
     api_key = APIKey(
         entity_id=entity_id,
+        created_by_entity_id=entity_id,
         name=name or "Unnamed Key",
         key_hash=key_hash,
         key_hint=f"{key[:7]}...{key[-4:]}",
