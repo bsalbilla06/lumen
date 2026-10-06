@@ -1,5 +1,7 @@
 """Tests for the profile blueprint routes."""
 import json
+from datetime import datetime
+from decimal import Decimal
 from http import HTTPStatus
 
 import pytest
@@ -223,6 +225,120 @@ def test_delete_key_not_found(auth_client):
 
 def test_delete_key_requires_login(client):
     resp = client.delete("/profile/keys/1", follow_redirects=False)
+    assert resp.status_code == HTTPStatus.FOUND
+
+
+# ---------------------------------------------------------------------------
+# rotate_key
+# ---------------------------------------------------------------------------
+
+def _seed_key_with_usage(app, entity_id, raw, active=True):
+    """Insert a key with non-zero usage counters; return its id."""
+    from lumen.extensions import db
+    from lumen.models.api_key import APIKey
+    from lumen.services.crypto import hash_api_key
+    with app.app_context():
+        ak = APIKey(
+            entity_id=entity_id, created_by_entity_id=entity_id, name="rotating",
+            key_hash=hash_api_key(raw), key_hint=f"{raw[:7]}...{raw[-4:]}", active=active,
+            requests=5, input_tokens=100, output_tokens=40, audio_seconds=7,
+            cost=Decimal("1.500000"), last_used_at=datetime(2026, 9, 1, 12, 0),
+            created_at=datetime(2026, 8, 1, 9, 0),
+        )
+        db.session.add(ak)
+        db.session.commit()
+        return ak.id
+
+
+def _key_snapshot(app, kid):
+    from lumen.extensions import db
+    from lumen.models.api_key import APIKey
+    with app.app_context():
+        ak = db.session.get(APIKey, kid)
+        return {c: getattr(ak, c) for c in (
+            "requests", "input_tokens", "output_tokens", "audio_seconds", "cost",
+            "last_used_at", "name", "created_at", "created_by_entity_id", "entity_id", "active",
+            "key_hash", "key_hint",
+        )}
+
+
+def test_rotate_key_swaps_secret_and_keeps_stats(app, client, auth_client, test_user):
+    old, new = "sk_" + "r" * 32, "sk_" + "n" * 32
+    kid = _seed_key_with_usage(app, test_user["id"], old)
+    before = _key_snapshot(app, kid)
+
+    resp = auth_client.post(f"/profile/keys/{kid}/rotate", json={"key": new})
+    assert resp.status_code == HTTPStatus.OK
+    assert resp.get_json() == {"id": kid, "name": "rotating", "key": new}
+
+    after = _key_snapshot(app, kid)
+    old_hash, new_hash = before.pop("key_hash"), after.pop("key_hash")
+    new_hint = after.pop("key_hint")
+    before.pop("key_hint")
+    assert new_hash != old_hash
+    assert new_hint == f"{new[:7]}...{new[-4:]}"
+    assert after == before
+
+    assert client.get("/v1/usage", headers={"Authorization": f"Bearer {old}"}).status_code == HTTPStatus.UNAUTHORIZED
+    usage = client.get("/v1/usage", headers={"Authorization": f"Bearer {new}"})
+    assert usage.status_code == HTTPStatus.OK
+    assert usage.get_json()["requests"] == 5
+
+
+def test_rotate_key_forbidden_for_other_user(app, auth_client, admin_user):
+    kid = _seed_key_with_usage(app, admin_user["id"], "sk_" + "o" * 32)
+    resp = auth_client.post(f"/profile/keys/{kid}/rotate", json={"key": "sk_" + "p" * 32})
+    assert resp.status_code == HTTPStatus.FORBIDDEN
+
+
+def test_rotate_key_inactive_returns_409(app, auth_client, test_user):
+    kid = _seed_key_with_usage(app, test_user["id"], "sk_" + "i" * 32, active=False)
+    resp = auth_client.post(f"/profile/keys/{kid}/rotate", json={"key": "sk_" + "j" * 32})
+    assert resp.status_code == HTTPStatus.CONFLICT
+
+
+@pytest.mark.parametrize("payload", [
+    {}, {"key": ""}, {"key": "badkey"}, {"key": 123}, {"key": ["sk_" + "v" * 32]}, ["sk_" + "v" * 32],
+])
+def test_rotate_key_invalid_key_returns_400(app, auth_client, test_user, payload):
+    kid = _seed_key_with_usage(app, test_user["id"], "sk_" + "v" * 32)
+    resp = auth_client.post(f"/profile/keys/{kid}/rotate", json=payload)
+    assert resp.status_code == HTTPStatus.BAD_REQUEST
+
+
+def test_rotate_key_duplicate_returns_409(app, auth_client, test_user):
+    kid = _seed_key_with_usage(app, test_user["id"], "sk_" + "w" * 32)
+    taken = "sk_" + "x" * 32
+    auth_client.post("/profile/keys", json={"key": taken})
+    resp = auth_client.post(f"/profile/keys/{kid}/rotate", json={"key": taken})
+    assert resp.status_code == HTTPStatus.CONFLICT
+    resp = auth_client.post(f"/profile/keys/{kid}/rotate", json={"key": "sk_" + "w" * 32})
+    assert resp.status_code == HTTPStatus.CONFLICT
+
+
+def test_rotate_key_concurrent_duplicate_returns_409(app, auth_client, test_user, monkeypatch):
+    """A secret committed by another request after the duplicate check yields 409, not 500."""
+    from lumen.blueprints.profile import routes as profile_routes
+    from lumen.services.crypto import hash_api_key
+    old, raced = "sk_" + "q" * 32, "sk_" + "k" * 32
+    kid = _seed_key_with_usage(app, test_user["id"], old)
+    auth_client.post("/profile/keys", json={"key": raced})
+    # Skip the pre-check so the unique constraint on key_hash is what catches the duplicate.
+    monkeypatch.setattr(profile_routes, "_new_key_fields",
+                        lambda key: ({"key_hash": hash_api_key(key), "key_hint": "sk_kkkk...kkkk"}, None))
+
+    resp = auth_client.post(f"/profile/keys/{kid}/rotate", json={"key": raced})
+    assert resp.status_code == HTTPStatus.CONFLICT
+    assert _key_snapshot(app, kid)["key_hint"] == f"{old[:7]}...{old[-4:]}"
+
+
+def test_rotate_key_not_found(auth_client):
+    resp = auth_client.post("/profile/keys/999999/rotate", json={"key": "sk_" + "y" * 32})
+    assert resp.status_code == HTTPStatus.NOT_FOUND
+
+
+def test_rotate_key_requires_login(client):
+    resp = client.post("/profile/keys/1/rotate", json={"key": "sk_" + "z" * 32}, follow_redirects=False)
     assert resp.status_code == HTTPStatus.FOUND
 
 
