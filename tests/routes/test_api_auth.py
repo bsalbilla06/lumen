@@ -639,12 +639,7 @@ def test_acknowledge_is_idempotent(app, client, test_user, test_model, api_key):
     second = client.post(url, headers=headers).get_json()
     assert first["tags"] == []
     assert first["notice"] == "Read me."
-    # Idempotent in every field except the (uncertain-to-the-second) timestamp,
-    # which still moves forward rather than being re-created.
-    assert second["id"] == first["id"]
-    assert second["tags"] == first["tags"] == []
-    assert second["notice"] == first["notice"]
-    assert second["acknowledged_at"].endswith("Z")
+    assert second == first
     with app.app_context():
         _set_model_flag(app, test_model, ack_message="Changed after ack.")
     third = client.post(url, headers=headers).get_json()
