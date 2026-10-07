@@ -201,12 +201,15 @@ def _ack_fields(config, row):
     web UI's "acknowledged on" display uses); ``notice`` is the combined
     acknowledgement + early-access text the model carries — the text the web ack
     dialog shows — or None for a model with no requirements.
+    With api.consent=false the API enforces no acknowledgement, so no
+    requirement is ever open and ``tags`` is always empty.
     """
     tags = []
-    if config.needs_ack and (row is None or row.consented_at is None):
-        tags.append("needs_ack")
-    if config.early_access and (row is None or row.early_access_at is None):
-        tags.append("early_access")
+    if current_app.config.get("API_REQUIRE_MODEL_CONSENT", True):
+        if config.needs_ack and (row is None or row.consented_at is None):
+            tags.append("needs_ack")
+        if config.early_access and (row is None or row.early_access_at is None):
+            tags.append("early_access")
 
     if tags:
         acknowledged_at = None

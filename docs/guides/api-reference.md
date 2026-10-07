@@ -121,6 +121,7 @@ Response (`200`):
 - `tags` is `[]` after a successful acknowledgment. If the model later gains a new requirement (for example it becomes early access), `tags` reports it and you must acknowledge once more.
 - `notice` echoes the text you acknowledged; a model with no requirements returns `tags: []` and no `notice` as a no-op.
 - If your account cannot use the model, an un-acknowledged consume call above returns `403` with `code: "consent_required"` and a message pointing at this endpoint.
+- If the server disables API model consent (`api.consent: false` in `config.yaml`), no requirement is enforced over the API: `tags` is always `[]` and `acknowledge` records nothing.
 
 ---
 
