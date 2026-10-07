@@ -15,7 +15,7 @@ All notable changes to Lumen will be documented in this file.
 - API keys record OAuth provenance (`client_id`, `requested_by`), shown in the profile key list tooltip.
 - Admins can add and remove a user's groups from the Edit User dialog.
 - Admins can reset a user's coins from the Coins Available card on their profile.
-- API-key consumers can acknowledge models that require it via `POST /v1/models/<id>/acknowledge`; `/v1/models` and `/v1/models/<id>` expose each model's `tags` (open acknowledgment requirements), `acknowledged_at`, and `notice`, and a consume call on an un-acknowledged model returns `403` with `code: "consent_required"` instead of a generic access error. ([#92](https://github.com/ncsa/lumen/issues/92))
+- API-key consumers can acknowledge model requirements and inspect consent state through the API. ([#92](https://github.com/ncsa/lumen/issues/92))
 
 ### Changed
 
