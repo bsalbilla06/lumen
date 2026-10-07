@@ -6,6 +6,7 @@ All notable changes to Lumen will be documented in this file.
 
 ### Added
 
+- API keys can be rotated in place, issuing a new secret while keeping the key's name and usage stats; project keys can only be rotated by the user who created them.
 - Show which user created each project API key.
 - API keys can retrieve their cumulative usage through `GET /v1/usage`, including the account's remaining coins.
 - Lumen is now licensed under the Apache License 2.0.
@@ -16,6 +17,7 @@ All notable changes to Lumen will be documented in this file.
 - Admins can add and remove a user's groups from the Edit User dialog.
 - Admins can reset a user's coins from the Coins Available card on their profile.
 - API-key consumers can acknowledge model requirements and inspect consent state through the API. ([#92](https://github.com/ncsa/lumen/issues/92))
+- Log a warning with email, affiliation and IdP when a login matches no auto-join group.
 
 ### Changed
 

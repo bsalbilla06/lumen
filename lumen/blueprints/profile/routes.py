@@ -5,6 +5,7 @@ from http import HTTPStatus
 
 from flask import Blueprint, abort, g, jsonify, redirect, render_template, request, session, url_for
 from sqlalchemy import delete, func, select, text
+from sqlalchemy.exc import IntegrityError
 
 from lumen.decorators import is_admin as _is_admin
 from lumen.decorators import is_admin_eligible, login_required
@@ -56,14 +57,14 @@ def _memberships_by_entity(entity_ids: list[int]) -> dict[int, list[dict]]:
     result: dict[int, list[dict]] = {}
     if not entity_ids:
         return result
-    for eid, g, is_owner in db.session.execute(
+    for eid, group, is_owner in db.session.execute(
         select(GroupMember.entity_id, Group, GroupMember.is_owner)
         .join(Group, Group.id == GroupMember.group_id)
         .where(GroupMember.entity_id.in_(entity_ids))
         .order_by(Group.name)
     ).all():
         result.setdefault(eid, []).append(
-            {"id": g.id, "name": g.name, "auto_join": g.auto_join, "is_owner": is_owner}
+            {"id": group.id, "name": group.name, "auto_join": group.auto_join, "is_owner": is_owner}
         )
     return result
 
@@ -316,6 +317,47 @@ def generate_key():
     return jsonify({"key": key})
 
 
+def _new_key_fields(key: str):
+    """Validate a client-supplied raw key for create/rotate.
+
+    Returns ({"key_hash", "key_hint"}, None) on success, or (None, error response).
+    """
+    if not key or not key.startswith("sk_"):
+        return None, (jsonify({"error": "Invalid key"}), HTTPStatus.BAD_REQUEST)
+
+    key_hash = hash_api_key(key)
+    if db.session.execute(select(APIKey).filter_by(key_hash=key_hash)).scalar_one_or_none():
+        return None, (jsonify({"error": "Key already exists"}), HTTPStatus.CONFLICT)
+
+    return {"key_hash": key_hash, "key_hint": f"{key[:7]}...{key[-4:]}"}, None
+
+
+def rotate_key_secret(api_key: APIKey):
+    """Replace api_key's secret with the request's key, keeping usage stats. Commits."""
+    if not api_key.active:
+        return jsonify({"error": "Key is inactive"}), HTTPStatus.CONFLICT
+
+    data = request.get_json()
+    key = data.get("key") if isinstance(data, dict) else None
+    if not isinstance(key, str):
+        return jsonify({"error": "Invalid key"}), HTTPStatus.BAD_REQUEST
+
+    key = key.strip()
+    fields, error = _new_key_fields(key)
+    if error:
+        return error
+
+    api_key.key_hash = fields["key_hash"]
+    api_key.key_hint = fields["key_hint"]
+    try:
+        db.session.commit()
+    except IntegrityError:
+        # A concurrent create/rotate committed the same secret after the duplicate check.
+        db.session.rollback()
+        return jsonify({"error": "Key already exists"}), HTTPStatus.CONFLICT
+    return jsonify({"id": api_key.id, "name": api_key.name, "key": key}), HTTPStatus.OK
+
+
 @profile_bp.route("/profile/keys", methods=["POST"])
 @login_required
 def create_key():
@@ -324,20 +366,16 @@ def create_key():
     name = (data.get("name") or "").strip()
     key = (data.get("key") or "").strip()
 
-    if not key or not key.startswith("sk_"):
-        return jsonify({"error": "Invalid key"}), HTTPStatus.BAD_REQUEST
-
-    key_hash = hash_api_key(key)
-    if db.session.execute(select(APIKey).filter_by(key_hash=key_hash)).scalar_one_or_none():
-        return jsonify({"error": "Key already exists"}), HTTPStatus.CONFLICT
+    fields, error = _new_key_fields(key)
+    if error:
+        return error
 
     api_key = APIKey(
         entity_id=entity_id,
         created_by_entity_id=entity_id,
         name=name or "Unnamed Key",
-        key_hash=key_hash,
-        key_hint=f"{key[:7]}...{key[-4:]}",
         active=True,
+        **fields,
     )
     db.session.add(api_key)
     db.session.commit()
@@ -357,6 +395,18 @@ def delete_key(kid):
     db.session.delete(api_key)
     db.session.commit()
     return "", HTTPStatus.NO_CONTENT
+
+
+@profile_bp.route("/profile/keys/<int:kid>/rotate", methods=["POST"])
+@login_required
+def rotate_key(kid):
+    entity_id = session["entity_id"]
+    api_key = db.get_or_404(APIKey, kid)
+
+    if api_key.entity_id != entity_id:
+        return jsonify({"error": "Forbidden"}), HTTPStatus.FORBIDDEN
+
+    return rotate_key_secret(api_key)
 
 
 def _purge_conversations(entity_id: int) -> int:

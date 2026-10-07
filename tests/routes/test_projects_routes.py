@@ -1,4 +1,7 @@
 """Tests for the projects blueprint (/projects/*)."""
+import re
+from datetime import datetime
+from decimal import Decimal
 from http import HTTPStatus
 
 import pytest
@@ -1010,6 +1013,192 @@ def test_delete_key_soft_deletes(app, managed_auth_client, managed_project, make
         from lumen.models.api_key import APIKey
         k = db.session.get(APIKey, key_id)
         assert k is None
+
+
+@pytest.fixture
+def make_created_key(app):
+    """Factory: create a key on a project with a given creator and usage stats. Returns key id."""
+    def _make(sid, creator_id, raw_key, active=True):
+        with app.app_context():
+            from lumen.extensions import db
+            from lumen.models.api_key import APIKey
+            from lumen.services.crypto import hash_api_key
+            key = APIKey(
+                entity_id=sid, created_by_entity_id=creator_id, name="rot-key",
+                key_hash=hash_api_key(raw_key), key_hint=f"{raw_key[:7]}...{raw_key[-4:]}", active=active,
+                requests=9, input_tokens=300, output_tokens=120, audio_seconds=3,
+                cost=Decimal("2.250000"), last_used_at=datetime(2026, 9, 2, 8, 0),
+                created_at=datetime(2026, 8, 2, 7, 0),
+            )
+            db.session.add(key)
+            db.session.commit()
+            return key.id
+    return _make
+
+
+def _add_manager(app, sid, user_id):
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity_manager import EntityManager
+        db.session.add(EntityManager(user_entity_id=user_id, project_entity_id=sid))
+        db.session.commit()
+
+
+def test_rotate_project_key_by_creator_keeps_stats(app, client, managed_auth_client, managed_project, test_user,
+                                                   make_created_key, unlimited_pool):
+    old, new = "sk_rotold123456789", "sk_rotnew123456789"
+    kid = make_created_key(managed_project["id"], test_user["id"], old)
+    fields = ("requests", "input_tokens", "output_tokens", "audio_seconds", "cost",
+              "last_used_at", "name", "created_at", "created_by_entity_id", "entity_id", "active")
+
+    def snapshot():
+        with app.app_context():
+            from lumen.extensions import db
+            from lumen.models.api_key import APIKey
+            k = db.session.get(APIKey, kid)
+            return {f: getattr(k, f) for f in fields}, k.key_hint
+
+    before, _ = snapshot()
+    resp = managed_auth_client.post(f"/projects/{managed_project['id']}/keys/{kid}/rotate", json={"key": new})
+    assert resp.status_code == HTTPStatus.OK
+    assert resp.get_json() == {"id": kid, "name": "rot-key", "key": new}
+    after, hint = snapshot()
+    assert after == before
+    assert hint == f"{new[:7]}...{new[-4:]}"
+
+    anon = app.test_client()
+    assert anon.get("/v1/usage", headers={"Authorization": f"Bearer {old}"}).status_code == HTTPStatus.UNAUTHORIZED
+    usage = anon.get("/v1/usage", headers={"Authorization": f"Bearer {new}"})
+    assert usage.status_code == HTTPStatus.OK
+    assert usage.get_json()["requests"] == 9
+
+
+def test_rotate_project_key_forbidden_for_other_manager(app, managed_auth_client, managed_project, second_user,
+                                                        make_created_key):
+    _add_manager(app, managed_project["id"], second_user["id"])
+    kid = make_created_key(managed_project["id"], second_user["id"], "sk_othermgr1234567")
+    resp = managed_auth_client.post(f"/projects/{managed_project['id']}/keys/{kid}/rotate",
+                                    json={"key": "sk_othermgrnew1234"})
+    assert resp.status_code == HTTPStatus.FORBIDDEN
+
+
+def test_rotate_project_key_forbidden_for_owner(app, owner_auth_client, owned_project, second_user,
+                                                make_created_key):
+    _add_manager(app, owned_project["id"], second_user["id"])
+    kid = make_created_key(owned_project["id"], second_user["id"], "sk_ownerrot1234567")
+    resp = owner_auth_client.post(f"/projects/{owned_project['id']}/keys/{kid}/rotate",
+                                  json={"key": "sk_ownerrotnew1234"})
+    assert resp.status_code == HTTPStatus.FORBIDDEN
+
+
+def test_rotate_project_key_forbidden_for_legacy_null_creator(managed_auth_client, managed_project, make_created_key):
+    kid = make_created_key(managed_project["id"], None, "sk_legacyrot123456")
+    resp = managed_auth_client.post(f"/projects/{managed_project['id']}/keys/{kid}/rotate",
+                                    json={"key": "sk_legacyrotnew123"})
+    assert resp.status_code == HTTPStatus.FORBIDDEN
+
+
+def test_rotate_project_key_forbidden_for_non_manager(app, auth_client, service_project, second_user,
+                                                      make_created_key):
+    _add_manager(app, service_project["id"], second_user["id"])
+    kid = make_created_key(service_project["id"], second_user["id"], "sk_nonmgrrot123456")
+    resp = auth_client.post(f"/projects/{service_project['id']}/keys/{kid}/rotate",
+                            json={"key": "sk_nonmgrrotnew123"})
+    assert resp.status_code == HTTPStatus.FORBIDDEN
+
+
+def test_rotate_project_key_from_other_project_returns_404(app, managed_auth_client, managed_project, test_user,
+                                                           make_created_key):
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity import Entity
+        other = Entity(entity_type="project", name="other-svc", initials="OS", active=True)
+        db.session.add(other)
+        db.session.commit()
+        other_id = other.id
+    kid = make_created_key(other_id, test_user["id"], "sk_otherproj123456")
+    resp = managed_auth_client.post(f"/projects/{managed_project['id']}/keys/{kid}/rotate",
+                                    json={"key": "sk_otherprojnew123"})
+    assert resp.status_code == HTTPStatus.NOT_FOUND
+
+
+def test_rotate_project_key_inactive_returns_409(managed_auth_client, managed_project, test_user, make_created_key):
+    kid = make_created_key(managed_project["id"], test_user["id"], "sk_inactiverot1234", active=False)
+    resp = managed_auth_client.post(f"/projects/{managed_project['id']}/keys/{kid}/rotate",
+                                    json={"key": "sk_inactiverotnew1"})
+    assert resp.status_code == HTTPStatus.CONFLICT
+
+
+@pytest.mark.parametrize("payload", [
+    {}, {"key": "bad-key-no-prefix"}, {"key": 123}, {"key": ["sk_invalidrotnew12"]}, ["sk_invalidrotnew12"],
+])
+def test_rotate_project_key_invalid_key_returns_400(managed_auth_client, managed_project, test_user,
+                                                    make_created_key, payload):
+    kid = make_created_key(managed_project["id"], test_user["id"], "sk_invalidrot12345")
+    resp = managed_auth_client.post(f"/projects/{managed_project['id']}/keys/{kid}/rotate", json=payload)
+    assert resp.status_code == HTTPStatus.BAD_REQUEST
+
+
+def test_rotate_project_key_duplicate_returns_409(managed_auth_client, managed_project, test_user,
+                                                  make_created_key):
+    kid = make_created_key(managed_project["id"], test_user["id"], "sk_duperot1234567")
+    make_created_key(managed_project["id"], test_user["id"], "sk_dupetaken123456")
+    resp = managed_auth_client.post(f"/projects/{managed_project['id']}/keys/{kid}/rotate",
+                                    json={"key": "sk_dupetaken123456"})
+    assert resp.status_code == HTTPStatus.CONFLICT
+
+
+def test_rotate_project_key_concurrent_duplicate_returns_409(managed_auth_client, managed_project, test_user,
+                                                             make_created_key, monkeypatch):
+    """A secret committed by another request after the duplicate check yields 409, not 500."""
+    from lumen.blueprints.profile import routes as profile_routes
+    from lumen.services.crypto import hash_api_key
+    kid = make_created_key(managed_project["id"], test_user["id"], "sk_raceoriginal123")
+    make_created_key(managed_project["id"], test_user["id"], "sk_racetaken123456")
+    # Skip the pre-check so the unique constraint on key_hash is what catches the duplicate.
+    monkeypatch.setattr(profile_routes, "_new_key_fields",
+                        lambda key: ({"key_hash": hash_api_key(key), "key_hint": "sk_race...3456"}, None))
+
+    resp = managed_auth_client.post(f"/projects/{managed_project['id']}/keys/{kid}/rotate",
+                                    json={"key": "sk_racetaken123456"})
+    assert resp.status_code == HTTPStatus.CONFLICT
+
+
+def _key_rows_can_rotate(html):
+    """Map key id -> can_rotate from the KEY_ROWS literal the project page renders."""
+    return {int(kid): flag == "true"
+            for kid, flag in re.findall(r"id: (\d+),.*?can_rotate: (true|false),", html, re.S)}
+
+
+def test_detail_rotate_only_on_own_active_keys(app, managed_auth_client, managed_project, test_user, second_user,
+                                               make_created_key):
+    _add_manager(app, managed_project["id"], second_user["id"])
+    sid = managed_project["id"]
+    own = make_created_key(sid, test_user["id"], "sk_ownrotui1234567")
+    own_inactive = make_created_key(sid, test_user["id"], "sk_owninactui12345", active=False)
+    other = make_created_key(sid, second_user["id"], "sk_otherrotui12345")
+    legacy = make_created_key(sid, None, "sk_legacyrotui1234")
+
+    html = managed_auth_client.get(f"/projects/{sid}").get_data(as_text=True)
+    assert _key_rows_can_rotate(html) == {own: True, own_inactive: True, other: False, legacy: False}
+    # The JS only renders Rotate for active rows with can_rotate.
+    assert "${rotate}<button" in html and "k.can_rotate" in html
+    assert 'id="rotatedKeyModal"' in html
+    assert "js/key-rotate.js" in html
+    # Creator ids are not exposed to the page.
+    assert "created_by_entity_id" not in html
+
+
+def test_detail_admin_cannot_rotate_others_keys(admin_client, service_project, test_user, make_created_key):
+    kid = make_created_key(service_project["id"], test_user["id"], "sk_adminrotui12345")
+    html = admin_client.get(f"/projects/{service_project['id']}").get_data(as_text=True)
+    assert _key_rows_can_rotate(html) == {kid: False}
+
+
+def test_rotate_project_key_requires_login(client, service_project):
+    resp = client.post(f"/projects/{service_project['id']}/keys/1/rotate",
+                       json={"key": "sk_nologin12345678"}, follow_redirects=False)
+    assert resp.status_code == HTTPStatus.FOUND
 
 
 # ---------------------------------------------------------------------------
