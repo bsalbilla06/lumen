@@ -65,43 +65,19 @@ _rates_lock = threading.Lock()
 # `model`, `messages`, `prompt`, `stream` are handled explicitly by the views;
 # `stream_options` is set server-side (Lumen forces include_usage for billing);
 # `cache_salt` is handled specially in _forward_params.
-_FORWARD_NATIVE = frozenset(
-    {
-        "temperature",
-        "top_p",
-        "max_tokens",
-        "max_completion_tokens",
-        "n",
-        "stop",
-        "presence_penalty",
-        "frequency_penalty",
-        "logit_bias",
-        "logprobs",
-        "top_logprobs",
-        "seed",
-        "response_format",
-        "tools",
-        "tool_choice",
-        "parallel_tool_calls",
-        "reasoning_effort",
-    }
-)
+_FORWARD_NATIVE = frozenset({
+    "temperature", "top_p", "max_tokens", "max_completion_tokens", "n", "stop",
+    "presence_penalty", "frequency_penalty", "logit_bias", "logprobs", "top_logprobs",
+    "seed", "response_format", "tools", "tool_choice", "parallel_tool_calls",
+    "reasoning_effort",
+})
 # Non-OpenAI extensions that vLLM/SGLang read from the raw JSON body. The OpenAI
 # SDK does not type these, so they must ride in a *server-built* extra_body — never
 # a client-supplied one.
-_FORWARD_EXTRA_BODY = frozenset(
-    {
-        "top_k",
-        "min_p",
-        "repetition_penalty",
-        "min_tokens",
-        "stop_token_ids",
-        "ignore_eos",
-        "skip_special_tokens",
-        "chat_template_kwargs",
-        "structural_tag",
-    }
-)
+_FORWARD_EXTRA_BODY = frozenset({
+    "top_k", "min_p", "repetition_penalty", "min_tokens", "stop_token_ids",
+    "ignore_eos", "skip_special_tokens", "chat_template_kwargs", "structural_tag",
+})
 
 
 def _forward_params(data: dict, entity_id: int) -> dict:
@@ -376,32 +352,32 @@ def get_usage():
     elif pool.max_coins == -2:
         coins_available = -2
     else:
-        balance = db.session.execute(select(EntityBalance).filter_by(entity_id=g.entity.id)).scalar_one_or_none()
+        balance = db.session.execute(
+            select(EntityBalance).filter_by(entity_id=g.entity.id)
+        ).scalar_one_or_none()
         coins_available = float(balance.coins_left) if balance else float(pool[2])
-    return jsonify(
-        {
-            "requests": key.requests,
-            "input_tokens": key.input_tokens,
-            "output_tokens": key.output_tokens,
-            "total_tokens": key.input_tokens + key.output_tokens,
-            "audio_seconds": key.audio_seconds,
-            "cost": float(key.cost),
-            "coins_available": coins_available,
-            "last_used_at": key.last_used_at.isoformat() + "Z" if key.last_used_at else None,
-        }
-    )
+    return jsonify({
+        "requests": key.requests,
+        "input_tokens": key.input_tokens,
+        "output_tokens": key.output_tokens,
+        "total_tokens": key.input_tokens + key.output_tokens,
+        "audio_seconds": key.audio_seconds,
+        "cost": float(key.cost),
+        "coins_available": coins_available,
+        "last_used_at": key.last_used_at.isoformat() + "Z" if key.last_used_at else None,
+    })
 
 
 @api_bp.route("/models", methods=["GET"])
 @api_key_required
 def list_models():
-    configs = db.session.execute(select(ModelConfig).where(ModelConfig.active).options(selectinload(ModelConfig.aliases))).scalars().all()
+    configs = db.session.execute(
+        select(ModelConfig).where(ModelConfig.active).options(selectinload(ModelConfig.aliases))
+    ).scalars().all()
     eps_by_model: dict = {}
-    for ep in (
-        db.session.execute(select(ModelEndpoint).where(ModelEndpoint.model_config_id.in_([c.id for c in configs]), ModelEndpoint.active.is_(True)))
-        .scalars()
-        .all()
-    ):
+    for ep in db.session.execute(
+        select(ModelEndpoint).where(ModelEndpoint.model_config_id.in_([c.id for c in configs]), ModelEndpoint.active.is_(True))
+    ).scalars().all():
         eps_by_model.setdefault(ep.model_config_id, []).append(ep)
     rates = _get_request_rates()
     if g.monitor:
@@ -415,7 +391,11 @@ def list_models():
         model_ids = [c.id for c in configs]
         access_statuses, _ = bulk_model_access_info(entity_id, model_ids)
         pool = get_pool_limit(entity_id)
-        permitted = [c for c in configs if pool is not None and access_statuses.get(c.id, "allowed") != "blocked"]
+        permitted = [
+            c for c in configs
+            if pool is not None
+            and access_statuses.get(c.id, "allowed") != "blocked"
+        ]
         consent_rows = {
             r.model_config_id: r
             for r in db.session.execute(
@@ -423,9 +403,7 @@ def list_models():
                     EntityModelConsent.entity_id == entity_id,
                     EntityModelConsent.model_config_id.in_(model_ids),
                 )
-            )
-            .scalars()
-            .all()
+            ).scalars().all()
         }
     data = []
     for c in permitted:
@@ -458,7 +436,9 @@ def get_model(model_id):
         # read its notice.
         if get_model_access_status(entity_id, config.id) == "blocked" or get_pool_limit(entity_id) is None:
             return _err(f"Model '{model_id}' not found", status=HTTPStatus.NOT_FOUND)
-    eps = db.session.execute(select(ModelEndpoint).where(ModelEndpoint.model_config_id == config.id, ModelEndpoint.active.is_(True))).scalars().all()
+    eps = db.session.execute(
+        select(ModelEndpoint).where(ModelEndpoint.model_config_id == config.id, ModelEndpoint.active.is_(True))
+    ).scalars().all()
     rates = _get_request_rates()
     ack = None
     if not g.monitor:
@@ -475,6 +455,7 @@ def get_model(model_id):
 
 @api_bp.route("/models/<model_id>/acknowledge", methods=["POST"])
 @api_key_required
+@limiter.limit(_api_limit, key_func=_api_key_id)
 def acknowledge_model(model_id):
     """Record entity-level consent for a model that requires acknowledgement.
 
@@ -535,11 +516,8 @@ def _preflight(model_name: str):
         return None, None, None, _err(f"Model '{model_name}' not found", status=HTTPStatus.NOT_FOUND)
     consent_required = current_app.config.get("API_REQUIRE_MODEL_CONSENT", True)
     ok, code, msg, effective, reason = check_coin_budget(
-        g.entity.id,
-        model_config.id,
-        require_consent=consent_required,
-        source="api",
-        model_name=model_name,
+        g.entity.id, model_config.id, require_consent=consent_required,
+        source="api", model_name=model_name,
     )
     if not ok:
         if code == HTTPStatus.TOO_MANY_REQUESTS:
@@ -550,17 +528,9 @@ def _preflight(model_name: str):
             # already follows — the OpenAI SDK branches on `code`.
             retry_after = coin_retry_after(g.entity.id)
             headers = {"Retry-After": str(retry_after)} if retry_after is not None else None
-            return (
-                None,
-                None,
-                None,
-                _err(
-                    msg,
-                    "insufficient_quota",
-                    code,
-                    err_code="insufficient_quota",
-                    headers=headers,
-                ),
+            return None, None, None, _err(
+                msg, "insufficient_quota", code,
+                err_code="insufficient_quota", headers=headers,
             )
         if reason == "needs_consent":
             # A 403 here means one of two things with opposite fixes: the entity
@@ -569,15 +539,10 @@ def _preflight(model_name: str):
             # it). Disambiguate with a `code`, mirroring the 429 taxonomy above.
             # The requested name works on the ack endpoint whether it is a
             # canonical name or an alias.
-            return (
-                None,
-                None,
-                None,
-                _err(
-                    f"This model requires acknowledgment before use. Acknowledge it via POST /v1/models/{model_name}/acknowledge.",
-                    status=code,
-                    err_code="consent_required",
-                ),
+            return None, None, None, _err(
+                f"This model requires acknowledgment before use. Acknowledge it via POST /v1/models/{model_name}/acknowledge.",
+                status=code,
+                err_code="consent_required",
             )
         return None, None, None, _err(msg, status=code)
     endpoint = get_next_endpoint(model_config.id)
@@ -603,12 +568,12 @@ def _complete_and_bill(model_name: str, messages: list, **kwargs):
     # Forward the endpoint's override name, else the CANONICAL model name — never
     # the alias a client may have requested.
     remote_model = endpoint.model_name or model_config.model_name
-    ep_api_key = endpoint.api_key
-    ep_url = endpoint.url
-    ep_id = endpoint.id
-    mc_id = model_config.id
-    mc_in_cost = float(model_config.input_cost_per_million)
-    mc_out_cost = float(model_config.output_cost_per_million)
+    ep_api_key   = endpoint.api_key
+    ep_url       = endpoint.url
+    ep_id        = endpoint.id
+    mc_id        = model_config.id
+    mc_in_cost   = float(model_config.input_cost_per_million)
+    mc_out_cost  = float(model_config.output_cost_per_million)
     timeout, max_retries = upstream_call_bounds(streaming=False)
     # The arrival marks live in the WSGI environ; read them while the request
     # context is current.
@@ -630,11 +595,13 @@ def _complete_and_bill(model_name: str, messages: list, **kwargs):
             # legitimately runs longer than LLM_READ_TIMEOUT is cut off here.
             # Retries are allowed (unlike the streaming path): this attempt is
             # finished and nothing has been sent to the client yet.
-            with openai.OpenAI(api_key=ep_api_key, base_url=ep_url, timeout=timeout, max_retries=max_retries) as client:
+            with openai.OpenAI(api_key=ep_api_key, base_url=ep_url,
+                               timeout=timeout, max_retries=max_retries) as client:
                 response = client.chat.completions.create(model=remote_model, messages=messages, **kwargs)
             duration = _time.monotonic() - t0
         except Exception as exc:
-            return None, _err(*_classify_upstream_error(exc, f"upstream LLM error (endpoint={ep_id} {ep_url} model={remote_model})"))
+            return None, _err(*_classify_upstream_error(
+                exc, f"upstream LLM error (endpoint={ep_id} {ep_url} model={remote_model})"))
 
         usage = response.usage
         if usage is None:
@@ -645,23 +612,12 @@ def _complete_and_bill(model_name: str, messages: list, **kwargs):
 
         cost = calculate_cost(usage_prompt, usage_completion, mc_in_cost, mc_out_cost)
         subtract_coins(entity_id, mc_id, cost, effective=effective)
-        update_stats(
-            entity_id,
-            mc_id,
-            "api",
-            usage_prompt,
-            usage_completion,
-            cost,
-            endpoint_id=ep_id,
-            duration=duration,
-            timing=timing,
-            upstream_t0=t0,
-            # Non-streaming: the whole body arrives in one piece, so the
-            # first chunk is the response and both marks are the duration.
-            ttft=duration,
-            ttft_visible=duration,
-            outcome="ok",
-        )
+        update_stats(entity_id, mc_id, "api", usage_prompt, usage_completion, cost,
+                     endpoint_id=ep_id, duration=duration,
+                     timing=timing, upstream_t0=t0,
+                     # Non-streaming: the whole body arrives in one piece, so the
+                     # first chunk is the response and both marks are the duration.
+                     ttft=duration, ttft_visible=duration, outcome="ok")
         _record_api_key_usage(ak_id, usage_prompt, usage_completion, cost)
         db.session.commit()
         # Report the requested name (which may be an alias), not the backend's.
@@ -708,12 +664,12 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
     # entire duration exhausts the pool under load.
     # Capitalize on the canonical model name for the backend call (never the alias).
     remote_model = endpoint.model_name or model_config.model_name
-    ep_api_key = endpoint.api_key
-    ep_url = endpoint.url
-    ep_id = endpoint.id
-    mc_id = model_config.id
-    mc_in_cost = float(model_config.input_cost_per_million)
-    mc_out_cost = float(model_config.output_cost_per_million)
+    ep_api_key   = endpoint.api_key
+    ep_url       = endpoint.url
+    ep_id        = endpoint.id
+    mc_id        = model_config.id
+    mc_in_cost   = float(model_config.input_cost_per_million)
+    mc_out_cost  = float(model_config.output_cost_per_million)
     db.session.remove()  # return connection to pool before the LLM call
 
     # The generator body runs after this request's contexts are gone, on
@@ -760,22 +716,14 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
             far the stream got. Shared by the break-on-disconnect path and
             GeneratorExit so the two cannot bill differently.
             """
-            input_tokens, output_tokens, cost = estimate_abort_usage(usage, messages, content_deltas, mc_in_cost, mc_out_cost)
+            input_tokens, output_tokens, cost = estimate_abort_usage(
+                usage, messages, content_deltas, mc_in_cost, mc_out_cost)
             record_stream_abort(
-                app,
-                billed=billed,
-                entity_id=entity_id,
-                model_config_id=mc_id,
-                source="api",
-                endpoint_id=ep_id,
-                stream_t0=t0,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cost=cost,
+                app, billed=billed, entity_id=entity_id, model_config_id=mc_id,
+                source="api", endpoint_id=ep_id, stream_t0=t0,
+                input_tokens=input_tokens, output_tokens=output_tokens, cost=cost,
                 effective=effective,
-                timing=timing,
-                ttft=t_first_any,
-                ttft_visible=t_first_visible,
+                timing=timing, ttft=t_first_any, ttft_visible=t_first_visible,
                 record_extra=lambda: _record_api_key_usage(ak_id, input_tokens, output_tokens, cost),
             )
 
@@ -796,12 +744,11 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
             # disconnect flag below is only polled between chunks, so while
             # blocked awaiting the next upstream chunk a disconnect cannot be
             # seen at all — the read timeout caps that blind window.
-            with openai.OpenAI(api_key=ep_api_key, base_url=ep_url, timeout=timeout, max_retries=max_retries) as client:
+            with openai.OpenAI(api_key=ep_api_key, base_url=ep_url,
+                               timeout=timeout, max_retries=max_retries) as client:
                 stream_options = {**kwargs.pop("stream_options", {}), "include_usage": True}
                 resp_stream = client.chat.completions.create(
-                    model=remote_model,
-                    messages=messages,
-                    stream=True,
+                    model=remote_model, messages=messages, stream=True,
                     stream_options=stream_options,
                     **kwargs,
                 )
@@ -831,37 +778,25 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
                     duration = _time.monotonic() - t0
                     if usage is not None:
                         cost = calculate_cost(
-                            usage.prompt_tokens,
-                            usage.completion_tokens,
-                            mc_in_cost,
-                            mc_out_cost,
+                            usage.prompt_tokens, usage.completion_tokens,
+                            mc_in_cost, mc_out_cost,
                         )
                         phase = "billing"
                         with app.app_context():
                             subtract_coins(entity_id, mc_id, cost, effective=effective)
-                            update_stats(
-                                entity_id,
-                                mc_id,
-                                "api",
-                                usage.prompt_tokens,
-                                usage.completion_tokens,
-                                cost,
-                                endpoint_id=ep_id,
-                                duration=duration,
-                                timing=timing,
-                                upstream_t0=t0,
-                                ttft=t_first_any,
-                                ttft_visible=t_first_visible,
-                                outcome="ok",
-                            )
+                            update_stats(entity_id, mc_id, "api", usage.prompt_tokens, usage.completion_tokens, cost,
+                                         endpoint_id=ep_id, duration=duration,
+                                         timing=timing, upstream_t0=t0,
+                                         ttft=t_first_any, ttft_visible=t_first_visible,
+                                         outcome="ok")
                             _record_api_key_usage(ak_id, usage.prompt_tokens, usage.completion_tokens, cost)
                             db.session.commit()
                         billed = True
                     else:
                         logger.warning(
-                            "Upstream did not return usage data for streaming request (model=%s, entity_id=%s) — tokens and cost not recorded.",
-                            model_name,
-                            entity_id,
+                            "Upstream did not return usage data for streaming request "
+                            "(model=%s, entity_id=%s) — tokens and cost not recorded.",
+                            model_name, entity_id,
                         )
                     # [DONE] goes last, after billing, matching llm.py. With the
                     # yield first, a client vanishing on this final event left
@@ -899,15 +834,15 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
                 # whole reply and the client has every chunk of it. An operator
                 # reading either would go looking at an endpoint that was fine.
                 logger.exception(
-                    "Billing failed after a completed streaming request (model=%s, entity_id=%s)",
-                    remote_model,
-                    entity_id,
+                    "Billing failed after a completed streaming request "
+                    "(model=%s, entity_id=%s)", remote_model, entity_id,
                 )
                 msg, err_type = "Internal error. Please try again.", "api_error"
             else:
                 msg, err_type, _ = _classify_upstream_error(
                     exc,
-                    f"Error during streaming request (endpoint={ep_id} {ep_url} model={remote_model}, entity_id={entity_id})",
+                    f"Error during streaming request "
+                    f"(endpoint={ep_id} {ep_url} model={remote_model}, entity_id={entity_id})",
                 )
             # Any half-finished billing was already rolled back when its app
             # context exited; nothing is held while the error events below
@@ -968,13 +903,13 @@ def _do_audio(kind: str):
     ak_id = g.api_key.id
 
     # Forward the endpoint's override name, else the CANONICAL model name.
-    remote_model = endpoint.model_name or model_config.model_name
-    ep_api_key = endpoint.api_key
-    ep_url = endpoint.url
-    ep_id = endpoint.id
-    mc_id = model_config.id
-    mc_in_cost = float(model_config.input_cost_per_million)
-    mc_out_cost = float(model_config.output_cost_per_million)
+    remote_model     = endpoint.model_name or model_config.model_name
+    ep_api_key       = endpoint.api_key
+    ep_url           = endpoint.url
+    ep_id            = endpoint.id
+    mc_id            = model_config.id
+    mc_in_cost       = float(model_config.input_cost_per_million)
+    mc_out_cost      = float(model_config.output_cost_per_million)
     mc_audio_per_hour = float(model_config.audio_cost_per_hour or 0)
     timeout, max_retries = upstream_call_bounds(streaming=False)
     # Read while the request context is current, like the paths above.
@@ -992,12 +927,14 @@ def _do_audio(kind: str):
             # Non-streaming: the read timeout bounds the whole transcription, and
             # the write timeout the upload of the audio file. A long recording can
             # legitimately exceed LLM_READ_TIMEOUT — raise it if that bites.
-            with openai.OpenAI(api_key=ep_api_key, base_url=ep_url, timeout=timeout, max_retries=max_retries) as client:
+            with openai.OpenAI(api_key=ep_api_key, base_url=ep_url,
+                               timeout=timeout, max_retries=max_retries) as client:
                 create = getattr(client.audio, kind).create
                 response = create(model=remote_model, file=(file_name, file_data, file_type), **extra)
             duration = _time.monotonic() - t0
         except Exception as exc:
-            return _err(*_classify_upstream_error(exc, f"upstream audio error (endpoint={ep_id} {ep_url} model={remote_model})"))
+            return _err(*_classify_upstream_error(
+                exc, f"upstream audio error (endpoint={ep_id} {ep_url} model={remote_model})"))
 
         # response is a pydantic model for json/verbose_json, or a plain string for
         # text/srt/vtt response formats (which carry no usage object).
@@ -1011,8 +948,7 @@ def _do_audio(kind: str):
             if mc_audio_per_hour == 0:
                 logger.warning(
                     "Audio model has no audio_cost_per_hour set (model=%s, entity_id=%s) — billed as zero cost.",
-                    model_name,
-                    entity_id,
+                    model_name, entity_id,
                 )
         elif isinstance(usage, dict) and (usage.get("type") == "tokens" or "prompt_tokens" in usage):
             in_tok = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
@@ -1022,24 +958,12 @@ def _do_audio(kind: str):
             logger.warning("Upstream did not return usage data (model=%s, entity_id=%s)", model_name, entity_id)
 
         subtract_coins(entity_id, mc_id, cost, effective=effective)
-        update_stats(
-            entity_id,
-            mc_id,
-            "api",
-            in_tok,
-            out_tok,
-            cost,
-            endpoint_id=ep_id,
-            duration=duration,
-            audio_seconds=seconds,
-            timing=timing,
-            upstream_t0=t0,
-            # Non-streaming: the transcription arrives in one piece, so the
-            # first chunk is the response and both marks are the duration.
-            ttft=duration,
-            ttft_visible=duration,
-            outcome="ok",
-        )
+        update_stats(entity_id, mc_id, "api", in_tok, out_tok, cost,
+                     endpoint_id=ep_id, duration=duration, audio_seconds=seconds,
+                     timing=timing, upstream_t0=t0,
+                     # Non-streaming: the transcription arrives in one piece, so the
+                     # first chunk is the response and both marks are the duration.
+                     ttft=duration, ttft_visible=duration, outcome="ok")
         _record_api_key_usage(ak_id, in_tok, out_tok, cost, audio_seconds=seconds)
         db.session.commit()
 

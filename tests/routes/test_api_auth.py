@@ -2,7 +2,7 @@
 from http import HTTPStatus
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 
 @pytest.fixture
@@ -823,6 +823,17 @@ def test_acknowledge_no_requirements_is_noop(
     assert body["acknowledged_at"] is None
     assert "notice" not in body
 
+    # Regression guard: the no-op must not create a consent row.
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity_model_consent import EntityModelConsent
+        count = db.session.execute(
+            select(func.count())
+            .select_from(EntityModelConsent)
+            .filter_by(entity_id=test_user["id"], model_config_id=test_model["id"])
+        ).scalar()
+        assert count == 0
+
 
 def test_monitor_token_cannot_acknowledge(app, client, test_model):
     monitor = "monitor-ack-token"
@@ -964,6 +975,17 @@ def test_acknowledge_available_when_api_consent_disabled(
         )
         assert resp.status_code == HTTPStatus.OK
         assert resp.get_json()["tags"] == []
+        # Regression guard: with consent enforcement off the ack must not
+        # create a consent row that takes effect if enforcement returns.
+        with app.app_context():
+            from lumen.extensions import db
+            from lumen.models.entity_model_consent import EntityModelConsent
+            count = db.session.execute(
+                select(func.count())
+                .select_from(EntityModelConsent)
+                .filter_by(entity_id=test_user["id"], model_config_id=test_model["id"])
+            ).scalar()
+            assert count == 0
     finally:
         _set_api_consent(app, True)
 
