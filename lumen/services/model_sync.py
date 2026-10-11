@@ -144,6 +144,37 @@ def _pinned_get(url: str, ip: str, headers: dict):
         pool.close()
 
 
+def _server_info_flags(info) -> dict:
+    """Return the capability flags from a /server_info or /get_server_info body.
+
+    SGLang (the body has one of the SGLang keys we consume) gives
+    backend="sglang", is_embedding and enable_multimodal. vLLM (the body has a
+    ``vllm_config`` object, only in JSON format) gives backend="vllm".
+    ``reasoning`` is added only when the backend reports its reasoning parser,
+    so older servers fall through to models.dev. Returns {} for any other body,
+    including vLLM's text format where ``vllm_config`` is a string.
+    """
+    if not isinstance(info, dict):
+        return {}
+    if any(k in info for k in ("max_req_input_len", "is_embedding", "enable_multimodal")):
+        flags = {
+            "backend": "sglang",
+            "is_embedding": bool(info.get("is_embedding")),
+            "enable_multimodal": info.get("enable_multimodal"),
+        }
+        if "reasoning_parser" in info:
+            flags["reasoning"] = bool(info["reasoning_parser"])
+        return flags
+    vllm_config = info.get("vllm_config")
+    if isinstance(vllm_config, dict):
+        flags = {"backend": "vllm"}
+        so_config = vllm_config.get("structured_outputs_config")
+        if isinstance(so_config, dict) and "reasoning_parser" in so_config:
+            flags["reasoning"] = bool(so_config["reasoning_parser"])
+        return flags
+    return {}
+
+
 def fetch_endpoint_model(endpoint: dict) -> dict | None:
     base = endpoint["url"].rstrip("/")
     try:
@@ -153,29 +184,31 @@ def fetch_endpoint_model(endpoint: dict) -> dict | None:
     root = _sglang_root(base)
     headers = {"Authorization": f"Bearer {endpoint.get('api_key', '')}"}
 
-    # SGLang: /get_server_info is the authoritative source — it exposes
-    # max_req_input_len (the real per-request limit from --context-length,
-    # not the model's theoretical max), is_embedding, and enable_multimodal.
-    # A 200 alone doesn't prove it's SGLang (a proxy/gateway in front of vLLM
-    # could return 200 for that path), so we only tag backend="sglang" when the
-    # body actually contains at least one SGLang-specific key we consume.
+    # Server info: SGLang always serves it, vLLM only in dev mode
+    # (VLLM_SERVER_DEV_MODE=1). Try the current /server_info first (JSON format,
+    # which SGLang ignores) and fall back to SGLang's deprecated
+    # /get_server_info alias. SGLang exposes max_req_input_len (the real
+    # per-request limit from --context-length, not the model's theoretical max),
+    # is_embedding, enable_multimodal and reasoning_parser. A 200 alone doesn't
+    # prove the backend (a proxy/gateway could answer 200 for that path), so a
+    # response is only used when it has a recognizable shape.
     # The endpoint is served at the server root (see _sglang_root), not /v1.
-    sglang_flags: dict = {}
-    try:
-        r = _pinned_get(f"{root}/get_server_info", pinned_ip, headers)
-        if 200 <= r.status < 300:
-            info = r.json()
-            if any(k in info for k in ("max_req_input_len", "is_embedding", "enable_multimodal")):
-                sglang_flags = {
-                    "backend": "sglang",
-                    "is_embedding": bool(info.get("is_embedding")),
-                    "enable_multimodal": info.get("enable_multimodal"),
-                }
-                mrl = info.get("max_req_input_len")
-                if mrl is not None:
-                    return {"id": info.get("served_model_name") or "", "max_model_len": mrl, **sglang_flags}
-    except Exception:
-        pass
+    server_flags: dict = {}
+    for path in ("/server_info?config_format=json", "/get_server_info"):
+        try:
+            r = _pinned_get(f"{root}{path}", pinned_ip, headers)
+            if 200 <= r.status < 300:
+                info = r.json()
+                server_flags = _server_info_flags(info)
+                if server_flags:
+                    mrl = info.get("max_req_input_len")
+                    if mrl is not None:
+                        return {"id": info.get("served_model_name") or "", "max_model_len": mrl, **server_flags}
+                    # Both paths describe the same server, so the alias adds
+                    # nothing; the context length comes from the fallbacks below.
+                    break
+        except Exception:
+            pass  # unreachable, non-JSON or blocked: try the next path
 
     # vLLM (or SGLang without max_req_input_len): /v1/models gives id + max_model_len.
     model_id = None
@@ -186,7 +219,7 @@ def fetch_endpoint_model(endpoint: dict) -> dict | None:
             model_id = models[0].get("id")
             mml = models[0].get("max_model_len")
             if mml is not None:
-                return {"id": model_id or "", "max_model_len": mml, **sglang_flags}
+                return {"id": model_id or "", "max_model_len": mml, **server_flags}
     except Exception:
         pass
 
@@ -195,14 +228,14 @@ def fetch_endpoint_model(endpoint: dict) -> dict | None:
         r = _pinned_get(f"{root}/get_model_info", pinned_ip, headers)
         info = r.json()
         if "context_length" in info:
-            return {"id": model_id or info.get("model_path", ""), "max_model_len": info["context_length"], **sglang_flags}
+            return {"id": model_id or info.get("model_path", ""), "max_model_len": info["context_length"], **server_flags}
     except Exception:
         pass
 
-    # SGLang responded with capability flags but no context length anywhere —
-    # still return them so the modality override can fire.
-    if sglang_flags:
-        return {"id": model_id or "", "max_model_len": None, **sglang_flags}
+    # The server info responded with capability flags but no context length
+    # anywhere — still return them so the modality and reasoning overrides fire.
+    if server_flags:
+        return {"id": model_id or "", "max_model_len": None, **server_flags}
 
     return None
 
@@ -317,6 +350,25 @@ def _average_price(dev_match: dict, price_index: dict[str, list[dict]]) -> tuple
     return avg_in, avg_out
 
 
+def _consensus_bool(dev_match: dict, price_index: dict[str, list[dict]], key: str) -> bool | None:
+    """Majority vote on a boolean field across every models.dev provider that
+    lists the same base model. Providers that don't report a boolean are
+    ignored, so a single reporting provider is a unanimous consensus. Votes are
+    counted per listing, not per provider: a provider listing the same base
+    model twice (e.g. ``m`` and ``m:free``) votes twice. Returns None on a tie
+    or when no provider reports a value.
+    """
+    needle = _normalize_id(dev_match.get("id", ""))
+    if not needle:
+        return None
+    votes = [m[key] for m in price_index.get(needle, []) if isinstance(m.get(key), bool)]
+    yes = sum(votes)
+    no = len(votes) - yes
+    if yes == no:
+        return None
+    return yes > no
+
+
 # ---------------------------------------------------------------------------
 # Server-authoritative modalities
 # ---------------------------------------------------------------------------
@@ -327,14 +379,25 @@ def _server_modalities(ep_model: dict, pending_in, current_in) -> tuple:
     Each component is the authoritative modality list, or None to mean
     "don't touch this field". pending_in is the input_modalities already
     proposed by models.dev (if any); current_in is the operator's current
-    value — used as the base to which image is added when multimodal is on.
+    value. The base is pending_in, else current_in, else ["text"].
+
+    enable_multimodal null/missing is SGLang's auto-detect default and says
+    nothing about the model's modalities, so it leaves both fields untouched.
+    False strips image/video from the base but keeps text and audio. True adds
+    image only when the base has no non-text input modality, so an audio-only
+    model is left as is.
     """
     if ep_model.get("is_embedding"):
         return ["text"], []
-    if ep_model.get("enable_multimodal") is True:
-        base = pending_in or current_in or ["text"]
-        return (base if "image" in base else [*base, "image"]), None
-    return ["text"], None
+    multimodal = ep_model.get("enable_multimodal")
+    if multimodal is None:
+        return None, None
+    base = pending_in or current_in or ["text"]
+    if multimodal is True:
+        if any(m != "text" for m in base):
+            return base, None
+        return [*base, "image"], None
+    return [m for m in base if m not in ("image", "video")] or ["text"], None
 
 
 # ---------------------------------------------------------------------------
@@ -387,12 +450,19 @@ def sync_model(model_def: dict) -> dict:
     if dev_match:
         for field, new_val in [
             ("knowledge_cutoff",   _normalize_knowledge(dev_match.get("knowledge"))),
-            ("supports_reasoning", dev_match.get("reasoning")),
             ("input_modalities",   (dev_match.get("modalities") or {}).get("input")),
             ("output_modalities",  (dev_match.get("modalities") or {}).get("output")),
         ]:
             if new_val is not None and model_def.get(field) != new_val:
                 updates[field] = new_val
+
+        # Reasoning: models.dev providers disagree on this flag, so take the
+        # majority across providers of the same base model rather than whichever
+        # listing matched first. A missing value counts as false, so an unset
+        # field isn't reported as a change when the consensus is false.
+        reasoning = _consensus_bool(dev_match, price_index, "reasoning")
+        if reasoning is not None and bool(model_def.get("supports_reasoning")) != reasoning:
+            updates["supports_reasoning"] = reasoning
 
         # Description: only fill in when the operator left it blank — never
         # overwrite a hand-written description with the models.dev blurb.
@@ -401,17 +471,28 @@ def sync_model(model_def: dict) -> dict:
             updates["description"] = dev_desc
 
         # Pricing: average across providers offering the same base model on
-        # models.dev, excluding $0 listings. Overwrites a stale/zero operator
-        # value the same way other fields are corrected on a trusted match.
-        avg_in, avg_out = _average_price(dev_match, price_index)
-        if avg_in is not None and model_def.get("input_cost_per_million") != avg_in:
-            updates["input_cost_per_million"] = avg_in
-        if avg_out is not None and model_def.get("output_cost_per_million") != avg_out:
-            updates["output_cost_per_million"] = avg_out
+        # models.dev, excluding $0 listings. Only for models that opt in with
+        # auto_price: true — otherwise the operator's hand-set price is kept.
+        if model_def.get("auto_price") is True:
+            avg_in, avg_out = _average_price(dev_match, price_index)
+            if avg_in is not None and model_def.get("input_cost_per_million") != avg_in:
+                updates["input_cost_per_million"] = avg_in
+            if avg_out is not None and model_def.get("output_cost_per_million") != avg_out:
+                updates["output_cost_per_million"] = avg_out
+
+    # A reasoning parser reported by the backend's server info is authoritative
+    # over models.dev: Lumen only receives thinking separately when the server
+    # runs one. A missing value still counts as false.
+    if ep_model and "reasoning" in ep_model:
+        if bool(model_def.get("supports_reasoning")) != ep_model["reasoning"]:
+            updates["supports_reasoning"] = ep_model["reasoning"]
+        else:
+            updates.pop("supports_reasoning", None)
 
     # SGLang /get_server_info capability flags are authoritative over models.dev
-    # — they reflect what the operator actually enabled on the serving backend,
-    # so a disabled modality on the server vetoes a models.dev claim.
+    # when set explicitly — they reflect what the operator configured on the
+    # serving backend. A null enable_multimodal (auto-detect) leaves the
+    # operator's or models.dev's modalities as they are.
     if ep_model and ep_model.get("backend") == "sglang":
         srv_in, srv_out = _server_modalities(
             ep_model,

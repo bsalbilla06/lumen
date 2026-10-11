@@ -7,7 +7,7 @@ from lumen.services.llm import (
     get_pool_limit,
     has_model_consent,
 )
-from tests.conftest import grant_model_to_group, make_group_with_member, set_model_owner
+from tests.conftest import make_group_with_member, make_project, set_model_owner
 
 
 @pytest.fixture
@@ -32,6 +32,14 @@ def _set_needs_ack(app, model_id):
     db.session.commit()
 
 
+def _grant_pool(app, entity_id):
+    """Give the entity a usable pool: a needs_consent denial presupposes one."""
+    from lumen.extensions import db
+    from lumen.models.entity_limit import EntityLimit
+    db.session.add(EntityLimit(entity_id=entity_id, max_coins=-2, refresh_coins=0, starting_coins=0))
+    db.session.commit()
+
+
 def _set_early_access(app, model_id):
     from lumen.extensions import db
     from lumen.models.model_config import ModelConfig
@@ -53,7 +61,7 @@ def test_public_model_allowed_for_user(app, ids):
 def test_public_model_allowed_for_project(app, ids):
     _, model_id = ids
     with app.app_context():
-        project_id = _make_entity(entity_type="project", email="proj@example.com", name="Proj")
+        project_id = make_project("Proj", email="proj@example.com").id
         assert get_model_access_status(project_id, model_id) == "allowed"
 
 
@@ -78,48 +86,25 @@ def test_owned_model_blocked_for_non_owner(app, ids):
         assert get_model_access(entity_id, model_id) is False
 
 
-def test_group_grant_allows_user_member(app, ids):
+def test_group_member_blocked_from_owned_model(app, ids):
+    """Group membership never grants an owned model."""
     entity_id, model_id = ids
     with app.app_context():
         owner_id = _make_entity()
         set_model_owner(model_id, owner_id)
-        group_id = make_group_with_member(entity_id)
-        grant_model_to_group(model_id, group_id)
-        assert get_model_access_status(entity_id, model_id) == "allowed"
-        assert get_model_access(entity_id, model_id) is True
+        make_group_with_member(entity_id)
+        assert get_model_access_status(entity_id, model_id) == "blocked"
+        assert get_model_access(entity_id, model_id) is False
 
 
-def test_group_grant_allows_project_member(app, ids):
+def test_project_group_member_blocked_from_owned_model(app, ids):
     _, model_id = ids
     with app.app_context():
         owner_id = _make_entity()
-        project_id = _make_entity(entity_type="project", email="proj@example.com", name="Proj")
+        project_id = make_project("Proj", email="proj@example.com").id
         set_model_owner(model_id, owner_id)
-        group_id = make_group_with_member(project_id)
-        grant_model_to_group(model_id, group_id)
-        assert get_model_access_status(project_id, model_id) == "allowed"
-
-
-def test_inactive_granted_group_blocked(app, ids):
-    entity_id, model_id = ids
-    with app.app_context():
-        owner_id = _make_entity()
-        set_model_owner(model_id, owner_id)
-        group_id = make_group_with_member(entity_id, active=False)
-        grant_model_to_group(model_id, group_id)
-        assert get_model_access_status(entity_id, model_id) == "blocked"
-
-
-def test_non_member_of_granted_group_blocked(app, ids):
-    entity_id, model_id = ids
-    with app.app_context():
-        owner_id = _make_entity()
-        member_id = _make_entity(email="member@example.com", name="Member")
-        set_model_owner(model_id, owner_id)
-        group_id = make_group_with_member(member_id)
-        grant_model_to_group(model_id, group_id)
-        assert get_model_access_status(entity_id, model_id) == "blocked"
-        assert get_model_access(entity_id, model_id) is False
+        make_group_with_member(project_id)
+        assert get_model_access_status(project_id, model_id) == "blocked"
 
 
 # ---------------------------------------------------------------------------
@@ -169,17 +154,6 @@ def test_needs_ack_for_owner(app, ids):
         assert get_model_access_status(entity_id, model_id) == "needs_ack"
 
 
-def test_needs_ack_for_granted_member(app, ids):
-    entity_id, model_id = ids
-    with app.app_context():
-        owner_id = _make_entity()
-        set_model_owner(model_id, owner_id)
-        group_id = make_group_with_member(entity_id)
-        grant_model_to_group(model_id, group_id)
-        _set_needs_ack(app, model_id)
-        assert get_model_access_status(entity_id, model_id) == "needs_ack"
-
-
 def test_early_access_resolves_to_needs_ack(app, ids):
     entity_id, model_id = ids
     with app.app_context():
@@ -191,17 +165,6 @@ def test_early_access_for_owner(app, ids):
     entity_id, model_id = ids
     with app.app_context():
         set_model_owner(model_id, entity_id)
-        _set_early_access(app, model_id)
-        assert get_model_access_status(entity_id, model_id) == "needs_ack"
-
-
-def test_early_access_for_granted_member(app, ids):
-    entity_id, model_id = ids
-    with app.app_context():
-        owner_id = _make_entity()
-        set_model_owner(model_id, owner_id)
-        group_id = make_group_with_member(entity_id)
-        grant_model_to_group(model_id, group_id)
         _set_early_access(app, model_id)
         assert get_model_access_status(entity_id, model_id) == "needs_ack"
 
@@ -237,35 +200,6 @@ def test_needs_ack_allows_chat_with_consent(app, ids):
         ))
         db.session.commit()
         assert get_model_access(entity_id, model_id) is True
-
-
-# ---------------------------------------------------------------------------
-# require_consent=False bypasses the consent gate for needs_ack models
-# ---------------------------------------------------------------------------
-
-def test_needs_ack_allows_access_when_require_consent_false(app, ids):
-    """require_consent=False skips the consent DB check — needs_ack treated as allowed."""
-    entity_id, model_id = ids
-    with app.app_context():
-        _set_needs_ack(app, model_id)
-        assert get_model_access(entity_id, model_id, require_consent=False) is True
-
-
-def test_needs_ack_still_blocked_when_require_consent_true(app, ids):
-    """require_consent=True (default) still gates on consent for needs_ack models."""
-    entity_id, model_id = ids
-    with app.app_context():
-        _set_needs_ack(app, model_id)
-        assert get_model_access(entity_id, model_id, require_consent=True) is False
-
-
-def test_blocked_model_still_blocked_when_require_consent_false(app, ids):
-    """require_consent=False never overrides a hard block (ownership)."""
-    entity_id, model_id = ids
-    with app.app_context():
-        owner_id = _make_entity()
-        set_model_owner(model_id, owner_id)
-        assert get_model_access(entity_id, model_id, require_consent=False) is False
 
 
 def test_has_model_consent_unknown_model_fails_closed(app, ids):
@@ -530,6 +464,7 @@ def test_unacknowledged_model_is_counted_as_needs_consent(app, ids, test_model, 
     from lumen.services.llm import check_coin_budget
     entity_id, model_id = ids
     with app.app_context():
+        _grant_pool(app, entity_id)
         _set_needs_ack(app, model_id)
         recorded = _recorder(monkeypatch)
         ok, code, _msg, _eff, reason = check_coin_budget(
@@ -541,19 +476,49 @@ def test_unacknowledged_model_is_counted_as_needs_consent(app, ids, test_model, 
         assert recorded == [("needs_consent", "chat", test_model["model_name"])]
 
 
-def test_consent_exempt_caller_on_a_blocked_model_is_no_access(app, ids, test_model, monkeypatch):
-    """With the consent gate off, a needs_ack model is not a consent rejection."""
+def test_zero_pool_unacknowledged_model_is_counted_as_no_access(app, ids, test_model, monkeypatch):
+    """Pool eligibility outranks the acknowledgement gate in the taxonomy.
+
+    An entity with a 0-coin pool is refused by the acknowledge endpoint too, so
+    labelling its denial needs_consent would send it chasing a 404.
+    """
+    from http import HTTPStatus
+
+    from lumen.extensions import db
+    from lumen.models.entity_limit import EntityLimit
     from lumen.services.llm import check_coin_budget
     entity_id, model_id = ids
     with app.app_context():
+        db.session.add(EntityLimit(
+            entity_id=entity_id, max_coins=0, refresh_coins=0, starting_coins=0,
+        ))
         _set_needs_ack(app, model_id)
+        db.session.commit()
+        recorded = _recorder(monkeypatch)
+        ok, code, _msg, _eff, reason = check_coin_budget(
+            entity_id, model_id, source="api", model_name=test_model["model_name"],
+        )
+        assert ok is False
+        assert code == HTTPStatus.FORBIDDEN
+        assert reason == "no_access"
+        assert recorded == [("no_access", "api", test_model["model_name"])]
+
+
+def test_acknowledged_blocked_model_is_counted_as_no_access(app, ids, test_model, monkeypatch):
+    """Consent on a model the entity cannot see is still a no_access rejection."""
+    from lumen.extensions import db
+    from lumen.models.entity_model_consent import EntityModelConsent
+    from lumen.services.llm import check_coin_budget
+    from lumen.timeutils import utcnow
+    entity_id, model_id = ids
+    with app.app_context():
+        _set_needs_ack(app, model_id)
+        db.session.add(EntityModelConsent(entity_id=entity_id, model_config_id=model_id, consented_at=utcnow()))
+        db.session.commit()
         owner_id = _make_entity()
         set_model_owner(model_id, owner_id)
         recorded = _recorder(monkeypatch)
-        check_coin_budget(
-            entity_id, model_id, require_consent=False, source="api",
-            model_name=test_model["model_name"],
-        )
+        check_coin_budget(entity_id, model_id, source="api", model_name=test_model["model_name"])
         assert recorded == [("no_access", "api", test_model["model_name"])]
 
 

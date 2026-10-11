@@ -4,9 +4,15 @@ All notable changes to Lumen will be documented in this file.
 
 ## [Unreleased]
 
+**Upgrade warning:** The database migration replaces `api_keys.active` with `revoked_at`, and older versions cannot run against the new schema. Stop every running replica before starting this version; a rolling update is not supported. This migration now has revision `a827b0223638` and runs after `a9b0c1d2e3f4` (model_group_access drop). If you added `revoked_at` by hand while upgrades were failing, the upgrade fails at `a827b0223638` with a duplicate-column error. Do not just `flask db stamp` it: stamping also skips `revoked_by_entity_id` and its FK, the backfill of inactive keys, dropping `active`, and the column comments. Stamp only after checking all of those are in place and `a9b0c1d2e3f4` has run; otherwise undo the manual change and let the migration run.
+
+**Breaking:** API requests now always require model acknowledgment and the `api.consent` setting has been removed. If your config.yaml or Helm values set `api.consent` (true or false), remove it, or Lumen will refuse to start. Before upgrading, have users acknowledge models on their profile or model page and project managers on the project page; API keys cannot use unacknowledged models. (#48)
+
 ### Added
 
+- Models can be set to take their price automatically from models.dev; manually set prices are no longer overwritten by Update. ([#117](https://github.com/ncsa/lumen/pull/117))
 - API keys can be rotated in place, issuing a new secret while keeping the key's name and usage stats; project keys can only be rotated by the user who created them.
+- Projects support users: users can create one API key, managers can add/remove users, only the owner can add/remove managers, and every project always has exactly one owner.
 - Show which user created each project API key.
 - API keys can retrieve their cumulative usage through `GET /v1/usage`, including the account's remaining coins.
 - Lumen is now licensed under the Apache License 2.0.
@@ -18,15 +24,28 @@ All notable changes to Lumen will be documented in this file.
 - Admins can reset a user's coins from the Coins Available card on their profile.
 - API-key consumers can acknowledge model requirements and inspect consent state through the API. ([#92](https://github.com/ncsa/lumen/issues/92))
 - Log a warning with email, affiliation and IdP when a login matches no auto-join group.
+- `scripts/responsive_check.py` audits pages for horizontal overflow at phone and tablet widths, and a UI test guards that server-rendered data tables sit in a `.table-responsive` wrapper.
 
 ### Changed
 
+- Illinois theme footer links to Illinois Chat, Lumen, LLMHub and LLMflux; other links moved into footer columns.
+- Compact the Model Dashboard table: grouped coin columns, health merged into status, relative check times; acknowledge models from the Access column.
 - Request and token totals of a million or more display compactly (e.g. "5.2 million", "16.1 billion").
 - Generated opencode configs (`lumen.sh` sync and the Connect page) advertise each model's `modalities`, `attachment`, `tool_call`, and `reasoning` flags, so OpenCode accepts image uploads for vision models instead of rejecting them client-side. ([#79](https://github.com/ncsa/lumen/issues/79))
 - The model dashboard lists each model's accepted inputs (text/image/audio) as pills next to its name. ([#79](https://github.com/ncsa/lumen/issues/79))
 - Require an owner when creating a project, with a user search in the owner field.
 - Only admins in admin mode can create groups.
 - **Breaking (Helm chart):** the chart no longer deploys vLLM/SGLang model servers; `models` is copied verbatim into `config.yaml` and uses the config format (snake_case keys, `endpoints` list).
+- Config editor model list is sorted A–Z, with disabled models listed after enabled ones; the first model in that order is selected by default.
+- Pages are usable on phones and tablets: tables scroll, toolbars wrap, and chat/help/config fill the screen on any device.
+- Remove usage stats and model grants from group pages; owned models are now usable only by their owner. ([#116](https://github.com/ncsa/lumen/pull/116))
+
+### Fixed
+
+- API keys are revoked instead of deleted: revoking a project, personal or OAuth-replaced key deactivates it, records when it was revoked, and keeps its usage history.
+- Fix model Update resetting input modalities to text-only on SGLang endpoints.
+- Model Update no longer flips or repeatedly reports reasoning; reasoning support is read from the serving backend's `/server_info` when available, otherwise from models.dev provider consensus.
+- Chat sidebar and message pane no longer resize while a reply streams.
 
 ## [2.1.0] - 2026-09-20
 

@@ -89,49 +89,51 @@
       <div class="card">
         <div class="card-header fw-semibold">Availability</div>
         <div class="card-body p-0">
-          <table class="table table-sm mb-0">
-            <caption class="visually-hidden">Endpoint availability</caption>
-            <tbody>
-              <tr>
-                <th scope="row" class="text-muted fw-normal ps-3">Status</th>
-                <td class="text-end pe-3">
-                  {% if status == "ok" %}
-                    <span class="badge bg-success">ok</span>
-                  {% elif status == "degraded" %}
-                    <span class="badge bg-warning text-dark">degraded</span>
-                  {% else %}
-                    <span class="badge bg-danger">down</span>
-                  {% endif %}
-                </td>
-              </tr>
-              <tr>
-                <th scope="row" class="text-muted fw-normal ps-3">Endpoints</th>
-                <td class="text-end pe-3">{{ healthy_count }}/{{ endpoints | length }} healthy</td>
-              </tr>
-              {% if config.end_date %}
-              <tr>
-                <th scope="row" class="text-muted fw-normal ps-3">Available until</th>
-                <td class="text-end pe-3"><span class="local-datetime" data-utc="{{ config.end_date.strftime('%Y-%m-%dT%H:%M:%SZ') }}"></span></td>
-              </tr>
-              {% endif %}
-              {% if is_admin %}
-              {% for ep in endpoints %}
-              <tr>
-                <th scope="row" class="text-muted fw-normal ps-3 small" style="word-break:break-all;">{{ ep.url }}</th>
-                <td class="text-end pe-3"><span class="badge {% if ep.healthy %}bg-success{% else %}bg-danger{% endif %}">{% if ep.healthy %}up{% else %}down{% endif %}</span></td>
-              </tr>
-              {% endfor %}
-              {% endif %}
-              <tr>
-                <th scope="row" class="text-muted fw-normal ps-3">Requests / hr</th>
-                <td class="text-end pe-3">{{ requests_last_hour | int }}</td>
-              </tr>
-              <tr>
-                <th scope="row" class="text-muted fw-normal ps-3">Requests / 24h</th>
-                <td class="text-end pe-3">{{ requests_last_day | int }}</td>
-              </tr>
-            </tbody>
-          </table>
+          <div class="table-responsive">
+            <table class="table table-sm mb-0">
+              <caption class="visually-hidden">Endpoint availability</caption>
+              <tbody>
+                <tr>
+                  <th scope="row" class="text-muted fw-normal ps-3">Status</th>
+                  <td class="text-end pe-3">
+                    {% if status == "ok" %}
+                      <span class="badge bg-success">ok</span>
+                    {% elif status == "degraded" %}
+                      <span class="badge bg-warning text-dark">degraded</span>
+                    {% else %}
+                      <span class="badge bg-danger">down</span>
+                    {% endif %}
+                  </td>
+                </tr>
+                <tr>
+                  <th scope="row" class="text-muted fw-normal ps-3">Endpoints</th>
+                  <td class="text-end pe-3">{{ healthy_count }}/{{ endpoints | length }} healthy</td>
+                </tr>
+                {% if config.end_date %}
+                <tr>
+                  <th scope="row" class="text-muted fw-normal ps-3">Available until</th>
+                  <td class="text-end pe-3"><span class="local-datetime" data-utc="{{ config.end_date.strftime('%Y-%m-%dT%H:%M:%SZ') }}"></span></td>
+                </tr>
+                {% endif %}
+                {% if is_admin %}
+                {% for ep in endpoints %}
+                <tr>
+                  <th scope="row" class="text-muted fw-normal ps-3 small" style="word-break:break-all;">{{ ep.url }}</th>
+                  <td class="text-end pe-3"><span class="badge {% if ep.healthy %}bg-success{% else %}bg-danger{% endif %}">{% if ep.healthy %}up{% else %}down{% endif %}</span></td>
+                </tr>
+                {% endfor %}
+                {% endif %}
+                <tr>
+                  <th scope="row" class="text-muted fw-normal ps-3">Requests / hr</th>
+                  <td class="text-end pe-3">{{ requests_last_hour | int }}</td>
+                </tr>
+                <tr>
+                  <th scope="row" class="text-muted fw-normal ps-3">Requests / 24h</th>
+                  <td class="text-end pe-3">{{ requests_last_day | int }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
 
@@ -143,77 +145,79 @@
       <div class="card">
         <div class="card-header fw-semibold">Model Details</div>
         <div class="card-body p-0">
-          <table class="table table-sm mb-0">
-            <caption class="visually-hidden">Model technical details</caption>
-            <tbody>
-              {% if config.url %}
-              <tr>
-                <th scope="row" class="text-muted fw-normal ps-3">HuggingFace</th>
-                <td class="text-end pe-3">
-                  <a href="{{ config.url }}" target="_blank" rel="noopener noreferrer"
-                     aria-label="View {{ config.model_name }} on HuggingFace (opens in new tab)">
-                    Model page
-                  </a>
-                </td>
-              </tr>
-              {% endif %}
-              {% if config.context_window %}
-              <tr>
-                <th scope="row" class="text-muted fw-normal ps-3">Context Window</th>
-                <td class="text-end pe-3">{{ "{:,}".format(config.context_window) }}</td>
-              </tr>
-              {% endif %}
-              {% if config.max_output_tokens %}
-              <tr>
-                <th scope="row" class="text-muted fw-normal ps-3">Max Output</th>
-                <td class="text-end pe-3">{{ "{:,}".format(config.max_output_tokens) }}</td>
-              </tr>
-              {% endif %}
-              {% if config.input_modalities %}
-              <tr>
-                <th scope="row" class="text-muted fw-normal ps-3">Input</th>
-                <td class="text-end pe-3">{{ config.input_modalities | join(", ") }}</td>
-              </tr>
-              {% endif %}
-              {% if config.output_modalities %}
-              <tr>
-                <th scope="row" class="text-muted fw-normal ps-3">Output</th>
-                <td class="text-end pe-3">{{ config.output_modalities | join(", ") }}</td>
-              </tr>
-              {% endif %}
-              {% if config.knowledge_cutoff %}
-              <tr>
-                <th scope="row" class="text-muted fw-normal ps-3">Knowledge Cutoff</th>
-                <td class="text-end pe-3">{{ config.knowledge_cutoff }}</td>
-              </tr>
-              {% endif %}
-              {% if config.supports_reasoning is not none %}
-              <tr>
-                <th scope="row" class="text-muted fw-normal ps-3">Reasoning</th>
-                <td class="text-end pe-3">{% if config.supports_reasoning %}<span role="img" aria-label="Supported">✓</span>{% else %}<span aria-label="Not supported">—</span>{% endif %}</td>
-              </tr>
-              {% endif %}
-              {% if config.supports_function_calling is not none %}
-              <tr>
-                <th scope="row" class="text-muted fw-normal ps-3">Function Calling</th>
-                <td class="text-end pe-3">{% if config.supports_function_calling %}<span role="img" aria-label="Supported">✓</span>{% else %}<span aria-label="Not supported">—</span>{% endif %}</td>
-              </tr>
-              {% endif %}
-              {% if config.created_at %}
-              <tr>
-                <th scope="row" class="text-muted fw-normal ps-3">First seen</th>
-                <td class="text-end pe-3"><span class="local-datetime" data-utc="{{ config.created_at.strftime('%Y-%m-%dT%H:%M:%SZ') }}"></span></td>
-              </tr>
-              {% endif %}
-            </tbody>
-          </table>
+          <div class="table-responsive">
+            <table class="table table-sm mb-0">
+              <caption class="visually-hidden">Model technical details</caption>
+              <tbody>
+                {% if config.url %}
+                <tr>
+                  <th scope="row" class="text-muted fw-normal ps-3">HuggingFace</th>
+                  <td class="text-end pe-3">
+                    <a href="{{ config.url }}" target="_blank" rel="noopener noreferrer"
+                       aria-label="View {{ config.model_name }} on HuggingFace (opens in new tab)">
+                      Model page
+                    </a>
+                  </td>
+                </tr>
+                {% endif %}
+                {% if config.context_window %}
+                <tr>
+                  <th scope="row" class="text-muted fw-normal ps-3">Context Window</th>
+                  <td class="text-end pe-3">{{ "{:,}".format(config.context_window) }}</td>
+                </tr>
+                {% endif %}
+                {% if config.max_output_tokens %}
+                <tr>
+                  <th scope="row" class="text-muted fw-normal ps-3">Max Output</th>
+                  <td class="text-end pe-3">{{ "{:,}".format(config.max_output_tokens) }}</td>
+                </tr>
+                {% endif %}
+                {% if config.input_modalities %}
+                <tr>
+                  <th scope="row" class="text-muted fw-normal ps-3">Input</th>
+                  <td class="text-end pe-3">{{ config.input_modalities | join(", ") }}</td>
+                </tr>
+                {% endif %}
+                {% if config.output_modalities %}
+                <tr>
+                  <th scope="row" class="text-muted fw-normal ps-3">Output</th>
+                  <td class="text-end pe-3">{{ config.output_modalities | join(", ") }}</td>
+                </tr>
+                {% endif %}
+                {% if config.knowledge_cutoff %}
+                <tr>
+                  <th scope="row" class="text-muted fw-normal ps-3">Knowledge Cutoff</th>
+                  <td class="text-end pe-3">{{ config.knowledge_cutoff }}</td>
+                </tr>
+                {% endif %}
+                {% if config.supports_reasoning is not none %}
+                <tr>
+                  <th scope="row" class="text-muted fw-normal ps-3">Reasoning</th>
+                  <td class="text-end pe-3">{% if config.supports_reasoning %}<span role="img" aria-label="Supported">✓</span>{% else %}<span aria-label="Not supported">—</span>{% endif %}</td>
+                </tr>
+                {% endif %}
+                {% if config.supports_function_calling is not none %}
+                <tr>
+                  <th scope="row" class="text-muted fw-normal ps-3">Function Calling</th>
+                  <td class="text-end pe-3">{% if config.supports_function_calling %}<span role="img" aria-label="Supported">✓</span>{% else %}<span aria-label="Not supported">—</span>{% endif %}</td>
+                </tr>
+                {% endif %}
+                {% if config.created_at %}
+                <tr>
+                  <th scope="row" class="text-muted fw-normal ps-3">First seen</th>
+                  <td class="text-end pe-3"><span class="local-datetime" data-utc="{{ config.created_at.strftime('%Y-%m-%dT%H:%M:%SZ') }}"></span></td>
+                </tr>
+                {% endif %}
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
       {% endif %}
 
       {% if is_admin %}
       <div class="card">
-        <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
+        <div class="card-header fw-semibold d-flex justify-content-between align-items-center flex-wrap gap-2">
           Access
           <button type="button" class="btn btn-sm btn-outline-primary edit-btn" id="model-access-edit-btn"
                   aria-label="Edit access for {{ config.model_name }}" aria-haspopup="dialog">
@@ -222,21 +226,11 @@
         </div>
         <div class="card-body">
           <p class="mb-1 small text-muted">Owner</p>
-          <p class="mb-2" id="model-access-owner">
+          <p class="mb-0" id="model-access-owner">
             {%- if config.owner -%}
               {{ config.owner.name }} <span class="text-muted small">({{ config.owner.email }})</span>
             {%- else -%}
               Everyone (public)
-            {%- endif -%}
-          </p>
-          <p class="mb-1 small text-muted">Granted groups</p>
-          <p class="mb-0" id="model-access-groups">
-            {%- if granted_group_names -%}
-              {%- for name in granted_group_names %}<span class="badge text-bg-secondary me-1">{{ name }}</span>{% endfor -%}
-            {%- elif config.owner -%}
-              <span class="text-muted">None</span>
-            {%- else -%}
-              <span class="text-muted">Not applicable — public model</span>
             {%- endif -%}
           </p>
         </div>
@@ -246,19 +240,21 @@
       <div class="card">
         <div class="card-header fw-semibold">Pricing</div>
         <div class="card-body p-0">
-          <table class="table table-sm mb-0">
-            <caption class="visually-hidden">Model pricing per million tokens</caption>
-            <tbody>
-              <tr>
-                <th scope="row" class="text-muted fw-normal ps-3">Input</th>
-                <td class="text-end pe-3">{{ "%.2f"|format(config.input_cost_per_million | float) }} / 1M</td>
-              </tr>
-              <tr>
-                <th scope="row" class="text-muted fw-normal ps-3">Output</th>
-                <td class="text-end pe-3">{{ "%.2f"|format(config.output_cost_per_million | float) }} / 1M</td>
-              </tr>
-            </tbody>
-          </table>
+          <div class="table-responsive">
+            <table class="table table-sm mb-0">
+              <caption class="visually-hidden">Model pricing per million tokens</caption>
+              <tbody>
+                <tr>
+                  <th scope="row" class="text-muted fw-normal ps-3">Input</th>
+                  <td class="text-end pe-3">{{ "%.2f"|format(config.input_cost_per_million | float) }} / 1M</td>
+                </tr>
+                <tr>
+                  <th scope="row" class="text-muted fw-normal ps-3">Output</th>
+                  <td class="text-end pe-3">{{ "%.2f"|format(config.output_cost_per_million | float) }} / 1M</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
 
@@ -277,7 +273,7 @@
         <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close Edit Access dialog"></button>
       </div>
       <div class="modal-body">
-        <p class="text-muted small mb-3">A model without an owner is available to everyone. An owned model is available only to its owner and to members of the granted groups.</p>
+        <p class="text-muted small mb-3">A model without an owner is available to everyone. An owned model is available only to its owner.</p>
         <div class="mb-3">
           <label class="form-label" for="access-owner-input">Owner (name or email)</label>
           <div class="d-flex gap-2">
@@ -291,11 +287,6 @@
           </div>
           <div class="form-text">Clear the owner to make the model available to everyone.</div>
         </div>
-        <fieldset class="mb-3">
-          <legend class="form-label fs-6">Granted groups</legend>
-          <div id="access-groups-list" class="border rounded p-2" style="max-height: 200px; overflow: auto;"></div>
-          <div class="form-text">Only applies when the model has an owner.</div>
-        </fieldset>
         <div id="access-edit-error" class="text-danger small" role="alert" aria-live="assertive" hidden></div>
       </div>
       <div class="modal-footer">
@@ -320,42 +311,18 @@
   const editBtn = document.getElementById('model-access-edit-btn');
   const modalEl = document.getElementById('editAccessModal');
   const ownerInput = document.getElementById('access-owner-input');
-  const groupsList = document.getElementById('access-groups-list');
   const errorEl = document.getElementById('access-edit-error');
   const modal = new bootstrap.Modal(modalEl);
-  const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
   initUserSearch({
     inputId: 'access-owner-input',
     listId: 'access-owner-list',
     searchUrl: {{ url_for('admin.users_search_api') | tojson }} + '?q=',
-    onChoose: () => syncGroupsEnabled(),
   });
-  ownerInput.addEventListener('input', syncGroupsEnabled);
   document.getElementById('access-owner-clear-btn').addEventListener('click', () => {
     ownerInput.value = '';
-    syncGroupsEnabled();
     ownerInput.focus();
   });
-
-  function syncGroupsEnabled() {
-    const hasOwner = ownerInput.value.trim() !== '';
-    groupsList.querySelectorAll('input[type="checkbox"]').forEach(cb => { cb.disabled = !hasOwner; });
-  }
-
-  function renderGroups(groups, grantedIds) {
-    if (!groups.length) {
-      groupsList.innerHTML = '<span class="text-muted small">No groups exist yet.</span>';
-      return;
-    }
-    groupsList.innerHTML = groups.map(g => `
-      <div class="form-check">
-        <input class="form-check-input" type="checkbox" id="access-group-${g.id}" value="${g.id}"
-               ${grantedIds.includes(g.id) ? 'checked' : ''}>
-        <label class="form-check-label" for="access-group-${g.id}">${esc(g.name)}${g.active ? '' : ' <span class="text-muted small">(inactive — members get no access)</span>'}</label>
-      </div>`).join('');
-    syncGroupsEnabled();
-  }
 
   editBtn.addEventListener('click', async () => {
     errorEl.hidden = true;
@@ -364,7 +331,6 @@
       if (!r.ok) throw new Error('load failed');
       const data = await r.json();
       ownerInput.value = data.owner ? data.owner.email : '';
-      renderGroups(data.groups, data.granted_group_ids);
       modal.show();
       setTimeout(() => ownerInput.focus(), 200);
     } catch (_) {
@@ -378,11 +344,10 @@
 
   document.getElementById('access-save-btn').addEventListener('click', async () => {
     errorEl.hidden = true;
-    const groupIds = [...groupsList.querySelectorAll('input[type="checkbox"]:checked')].map(cb => parseInt(cb.value, 10));
     const resp = await fetch(ACCESS_URL, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
-      body: JSON.stringify({ owner_email: ownerInput.value.trim(), group_ids: groupIds }),
+      body: JSON.stringify({ owner_email: ownerInput.value.trim() }),
     });
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) {

@@ -105,7 +105,7 @@ curl -X POST https://lumen.example.com/v1/models/qwen-coder-cc/acknowledge \
   -H "Authorization: Bearer sk_your_api_key_here"
 ```
 
-`<id>` may be an alias or the canonical name. Consent is recorded per account (shared across all of its API keys, matching the web UI), and one call satisfies every currently-open requirement — `needs_ack` and/or `early_access`. The endpoint is idempotent: repeating it returns the same `200` shape, so callers can safely retry after a timeout. Acking a blocked, disabled, expired, deleted, or unknown model returns `404`.
+`<id>` may be an alias or the canonical name (including names containing slashes, such as `org/model`). Consent is recorded per account (shared across all of its API keys, matching the web UI), and one call satisfies every currently-open requirement — `needs_ack` and/or `early_access`. The endpoint is idempotent: repeating it returns the same `200` shape, so callers can safely retry after a timeout, even when two retries land at once. Acking a blocked, disabled, expired, deleted, or unknown model returns `404`.
 
 Response (`200`):
 
@@ -121,7 +121,6 @@ Response (`200`):
 - `tags` is `[]` after a successful acknowledgment. If the model later gains a new requirement (for example it becomes early access), `tags` reports it and you must acknowledge once more.
 - `notice` echoes the text you acknowledged; a model with no requirements returns `tags: []` and no `notice` as a no-op.
 - If your account cannot use the model, an un-acknowledged consume call above returns `403` with `code: "consent_required"` and a message pointing at this endpoint.
-- If the server disables API model consent (`api.consent: false` in `config.yaml`), no requirement is enforced over the API: `tags` is always `[]` and `acknowledge` records nothing.
 
 ---
 

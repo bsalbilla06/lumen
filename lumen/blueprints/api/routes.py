@@ -12,6 +12,7 @@ import openai
 from flask import Blueprint, Response, current_app, g, jsonify, request
 from sqlalchemy import case, func, select
 from sqlalchemy import update as sa_update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from lumen.blueprints.metrics.middleware import observe_stream_abort
@@ -177,15 +178,12 @@ def _ack_fields(config, row):
     web UI's "acknowledged on" display uses); ``notice`` is the combined
     acknowledgement + early-access text the model carries — the text the web ack
     dialog shows — or None for a model with no requirements.
-    With api.consent=false the API enforces no acknowledgement, so no
-    requirement is ever open and ``tags`` is always empty.
     """
     tags = []
-    if current_app.config.get("API_REQUIRE_MODEL_CONSENT", True):
-        if config.needs_ack and (row is None or row.consented_at is None):
-            tags.append("needs_ack")
-        if config.early_access and (row is None or row.early_access_at is None):
-            tags.append("early_access")
+    if config.needs_ack and (row is None or row.consented_at is None):
+        tags.append("needs_ack")
+    if config.early_access and (row is None or row.early_access_at is None):
+        tags.append("early_access")
 
     if tags:
         acknowledged_at = None
@@ -328,8 +326,8 @@ def api_key_required(f):
 
         g.monitor = False
         api_key = db.session.execute(select(APIKey).filter_by(key_hash=hash_api_key(token))).scalar_one_or_none()
-        if not api_key or not api_key.active:
-            return _err("Invalid or inactive API key", "authentication_error", HTTPStatus.UNAUTHORIZED)
+        if not api_key or api_key.revoked_at is not None:
+            return _err("Invalid or revoked API key", "authentication_error", HTTPStatus.UNAUTHORIZED)
 
         entity = db.session.get(Entity, api_key.entity_id)
         if not entity or not entity.active:
@@ -423,7 +421,7 @@ def list_models():
     return jsonify({"object": "list", "data": data})
 
 
-@api_bp.route("/models/<model_id>", methods=["GET"])
+@api_bp.route("/models/<path:model_id>", methods=["GET"])
 @api_key_required
 def get_model(model_id):
     config = resolve_model_config(model_id)
@@ -453,7 +451,7 @@ def get_model(model_id):
     return jsonify(d)
 
 
-@api_bp.route("/models/<model_id>/acknowledge", methods=["POST"])
+@api_bp.route("/models/<path:model_id>/acknowledge", methods=["POST"])
 @api_key_required
 @limiter.limit(_api_limit, key_func=_api_key_id)
 def acknowledge_model(model_id):
@@ -482,15 +480,32 @@ def acknowledge_model(model_id):
     notice = "\n\n".join(n for n in (ack_notice, early_notice) if n) or None
 
     row = db.session.execute(select(EntityModelConsent).filter_by(entity_id=entity_id, model_config_id=config.id)).scalar_one_or_none()
-    if current_app.config.get("API_REQUIRE_MODEL_CONSENT", True) and (config.needs_ack or config.early_access):
+    if config.needs_ack or config.early_access:
+        now = utcnow()
         if row is None:
             row = EntityModelConsent(entity_id=entity_id, model_config_id=config.id)
-            db.session.add(row)
-        now = utcnow()
-        if config.needs_ack and row.consented_at is None:
-            row.consented_at = now
-        if config.early_access and row.early_access_at is None:
-            row.early_access_at = now
+            if config.needs_ack:
+                row.consented_at = now
+            if config.early_access:
+                row.early_access_at = now
+            # Race-safe first insert (same pattern as subtract_coins): two
+            # concurrent first acks — overlapping retries, or two keys of one
+            # entity — would otherwise make the loser's commit raise
+            # IntegrityError and 500 instead of the promised idempotent 200.
+            try:
+                with db.session.begin_nested():
+                    db.session.add(row)
+            except IntegrityError:
+                # The winner's row is the persisted state; report that. If it
+                # vanished (winner aborted), the requirement is honestly open.
+                row = db.session.execute(
+                    select(EntityModelConsent).filter_by(entity_id=entity_id, model_config_id=config.id)
+                ).scalar_one_or_none()
+        else:
+            if config.needs_ack and row.consented_at is None:
+                row.consented_at = now
+            if config.early_access and row.early_access_at is None:
+                row.early_access_at = now
         db.session.commit()
 
     tags, acknowledged_at, _ = _ack_fields(config, row)
@@ -514,10 +529,8 @@ def _preflight(model_name: str):
     model_config = resolve_model_config(model_name)
     if not model_config:
         return None, None, None, _err(f"Model '{model_name}' not found", status=HTTPStatus.NOT_FOUND)
-    consent_required = current_app.config.get("API_REQUIRE_MODEL_CONSENT", True)
     ok, code, msg, effective, reason = check_coin_budget(
-        g.entity.id, model_config.id, require_consent=consent_required,
-        source="api", model_name=model_name,
+        g.entity.id, model_config.id, source="api", model_name=model_name,
     )
     if not ok:
         if code == HTTPStatus.TOO_MANY_REQUESTS:

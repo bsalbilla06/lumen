@@ -2,7 +2,7 @@ import hashlib
 from http import HTTPStatus
 
 from flask import Blueprint, abort, jsonify, render_template, request, session, url_for
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from lumen.blueprints.admin.routes import apply_coin_pool_edit
@@ -17,6 +17,7 @@ from lumen.models.entity_manager import (
     EntityManager,
     get_managed_projects,
     get_project_owner,
+    get_project_role,
     is_project_owner,
 )
 from lumen.models.entity_model_consent import EntityModelConsent
@@ -32,6 +33,10 @@ _VALID_PER_PAGE = {25, 50, 100, 200}
 # Sentinel for "unlimited" sort key (mirrors admin/routes.py): -2 is the
 # canonical "unlimited" value, encoded as BIGINT_MAX so it sorts last.
 _BIGINT_MAX = 9223372036854775807
+# Roles a project member can hold; the owner is a manager the project points at.
+_MEMBER_ROLES = ("user", "manager")
+# Members-list order on the project page.
+_ROLE_RANK = {"owner": 0, "manager": 1, "user": 2}
 
 
 def _require_project_access(entity_id: int, sid: int):
@@ -54,6 +59,33 @@ def _require_project_admin(entity_id: int, sid: int):
     entity = db.session.get(Entity, entity_id)
     if not is_admin(entity) and not is_project_owner(entity_id, sid):
         abort(HTTPStatus.FORBIDDEN)
+
+
+def _require_project_manager(entity_id: int, sid: int):
+    """Abort 403 unless caller is a global admin, the owner, or a manager.
+
+    Manager-level actions: search for and add/remove plain users.
+    Members with the 'user' role are rejected here.
+    """
+    entity = db.session.get(Entity, entity_id)
+    if not is_admin(entity) and get_project_role(entity_id, sid) not in ("owner", "manager"):
+        abort(HTTPStatus.FORBIDDEN)
+
+
+def _can_administer(entity_id: int, sid: int) -> bool:
+    """True for a global admin or the project's owner (owner-level rights)."""
+    return is_admin(db.session.get(Entity, entity_id)) or is_project_owner(entity_id, sid)
+
+
+def _is_plain_user(entity_id: int, sid: int) -> bool:
+    """True if the caller is a project member with only the 'user' role.
+
+    Global admins never count as plain users, even if they hold a 'user'
+    membership row.
+    """
+    if is_admin(db.session.get(Entity, entity_id)):
+        return False
+    return get_project_role(entity_id, sid) == "user"
 
 
 def _scoped_project_ids(entity_id, entity):
@@ -116,6 +148,7 @@ def data():
             EntityManager.project_entity_id.label("project_id"),
             func.count(EntityManager.id).label("mgr_count"),
         )
+        .where(EntityManager.role == "manager")
         .group_by(EntityManager.project_entity_id)
         .subquery()
     )
@@ -186,12 +219,6 @@ def data():
 
     # Per-row data for the inline edit dialog: whether the caller owns the
     # project, and the project's own coin limit (None = inherited pool).
-    owner_ids = {
-        em.project_entity_id
-        for em in db.session.execute(
-            select(EntityManager).filter_by(user_entity_id=entity_id, is_owner=True)
-        ).scalars().all()
-    }
     page_ids = [c.id for c, *_ in rows]
     limits = {
         lim.entity_id: lim
@@ -214,7 +241,7 @@ def data():
                 "cost": float(cost),
                 "created": c.created_at.strftime("%Y-%m-%dT%H:%M:%SZ") if c.created_at else None,
                 "detail_url": url_for("projects.detail", sid=c.id),
-                "is_owner": c.id in owner_ids,
+                "is_owner": c.owner_entity_id == entity_id,
                 "max_coins": float(limits[c.id].max_coins) if c.id in limits else None,
                 "refresh_coins": float(limits[c.id].refresh_coins) if c.id in limits else None,
             }
@@ -233,19 +260,49 @@ def detail(sid):
     project = db.first_or_404(select(Entity).filter_by(id=sid, entity_type="project"))
     _require_project_access(entity_id, sid)
 
-    data = _get_profile_data(sid)
+    entity = db.session.get(Entity, entity_id)
+    admin = is_admin(entity)
+    caller_role = get_project_role(entity_id, sid)
+    # Same rule as _is_plain_user, without re-querying the role.
+    plain_user = not admin and caller_role == "user"
 
-    managers = db.session.execute(
-        select(Entity)
-        .join(EntityManager, EntityManager.user_entity_id == Entity.id)
-        .where(EntityManager.project_entity_id == sid)
-        .order_by(Entity.name)
-    ).scalars().all()
+    data = _get_profile_data(sid)
+    # Users see only the keys they created. The key rows are embedded in the
+    # page, so the filter has to happen here, not in the template.
+    if plain_user:
+        data["api_keys"] = [k for k in data["api_keys"] if k.created_by_entity_id == entity_id]
+        data["key_creators"] = {k.id: data["key_creators"][k.id] for k in data["api_keys"]}
+        data["key_revokers"] = {k.id: data["key_revokers"][k.id] for k in data["api_keys"]}
 
     owner = get_project_owner(sid)
     owner_id = owner.id if owner else None
-    entity = db.session.get(Entity, entity_id)
-    can_manage = is_admin(entity) or (owner_id == entity_id)
+    # (member, role) pairs; the owner's stored role is 'manager', shown as 'owner'.
+    members_stmt = (
+        select(Entity, EntityManager.role)
+        .join(EntityManager, EntityManager.user_entity_id == Entity.id)
+        .where(EntityManager.project_entity_id == sid)
+    )
+    # Users see only the managers, the owner and themselves, never the other
+    # users; like the keys, the member rows are embedded in the page.
+    if plain_user:
+        members_stmt = members_stmt.where(db.or_(
+            EntityManager.role == "manager",
+            Entity.id == project.owner_entity_id,
+            Entity.id == entity_id,
+        ))
+    # Listed owner first, then managers, then users, A-Z within each group.
+    members = sorted(
+        (
+            (member, "owner" if member.id == owner_id else role)
+            for member, role in db.session.execute(members_stmt).all()
+        ),
+        key=lambda m: (_ROLE_RANK[m[1]], (m[0].name or "").lower()),
+    )
+
+    # Flags for the template only; the routes below enforce the same rules.
+    can_manage = admin or caller_role == "owner"
+    can_add_members = can_manage or caller_role == "manager"
+    key_limit_reached = plain_user and any(k.revoked_at is None for k in data["api_keys"])
 
     h = hashlib.md5(project.name.strip().lower().encode(), usedforsecurity=False).hexdigest()
     gravatar_url = f"https://www.gravatar.com/avatar/{h}?s=230&d=identicon&f=y"
@@ -262,9 +319,14 @@ def detail(sid):
     return render_template(
         "project_detail.html",
         project=project,
-        managers=managers,
+        members=members,
         owner_id=owner_id,
+        caller_role=caller_role,
         can_manage=can_manage,
+        can_add_members=can_add_members,
+        key_limit_reached=key_limit_reached,
+        show_key_creators=not plain_user,
+        can_acknowledge=not plain_user,
         gravatar_url=gravatar_url,
         project_limit=project_limit,
         rotatable_key_ids=rotatable_key_ids,
@@ -346,11 +408,14 @@ def create_project():
     if not owner_user:
         return jsonify({"error": "Owner user not found"}), HTTPStatus.NOT_FOUND
 
+    # The owner pointer's FK into entity_managers is deferred, so the project
+    # and the owner's membership row only have to agree at commit.
     project = Entity(
         entity_type="project",
         name=name,
         initials=name[:2].upper(),
         active=True,
+        owner_entity_id=owner_user.id,
     )
     db.session.add(project)
     db.session.flush()
@@ -358,7 +423,6 @@ def create_project():
     db.session.add(EntityManager(
         user_entity_id=owner_user.id,
         project_entity_id=project.id,
-        is_owner=True,
     ))
 
     db.session.commit()
@@ -379,7 +443,7 @@ def delete_project(sid):
 @login_required
 def search_project_users(sid):
     entity_id = session["entity_id"]
-    _require_project_admin(entity_id, sid)
+    _require_project_manager(entity_id, sid)
 
     q = (request.args.get("q") or "").strip()
     if len(q) < 2:
@@ -411,14 +475,20 @@ def search_project_users(sid):
 
 @projects_bp.route("/projects/<int:sid>/users", methods=["POST"])
 @login_required
-def add_project_manager(sid):
+def add_project_member(sid):
     entity_id = session["entity_id"]
-    _require_project_admin(entity_id, sid)
+    _require_project_manager(entity_id, sid)
 
     data = request.get_json() or {}
     email = (data.get("email") or "").strip()
     if not email:
         return jsonify({"error": "Email required"}), HTTPStatus.BAD_REQUEST
+    # Only an omitted role defaults to user; "", null and other values are rejected.
+    role = data.get("role", "user")
+    if role not in _MEMBER_ROLES:
+        return jsonify({"error": "Role must be 'user' or 'manager'"}), HTTPStatus.BAD_REQUEST
+    if role == "manager" and not _can_administer(entity_id, sid):
+        return jsonify({"error": "Only the owner can add managers"}), HTTPStatus.FORBIDDEN
 
     db.first_or_404(select(Entity).filter_by(id=sid, entity_type="project"))
 
@@ -430,73 +500,104 @@ def add_project_manager(sid):
         select(EntityManager).filter_by(user_entity_id=user.id, project_entity_id=sid)
     ).scalar_one_or_none()
     if existing:
-        return jsonify({"error": "User already manages this project"}), HTTPStatus.CONFLICT
+        return jsonify({"error": "User is already a member of this project"}), HTTPStatus.CONFLICT
 
-    new_assoc = EntityManager(user_entity_id=user.id, project_entity_id=sid)
+    new_assoc = EntityManager(user_entity_id=user.id, project_entity_id=sid, role=role)
     db.session.add(new_assoc)
     db.session.commit()
 
-    return jsonify({"user_id": user.id, "name": user.name, "email": user.email}), HTTPStatus.CREATED
+    return jsonify(
+        {"user_id": user.id, "name": user.name, "email": user.email, "role": role}
+    ), HTTPStatus.CREATED
 
 
 @projects_bp.route("/projects/<int:sid>/users/<int:uid>", methods=["DELETE"])
 @login_required
-def remove_project_manager(sid, uid):
+def remove_project_member(sid, uid):
     entity_id = session["entity_id"]
-    _require_project_admin(entity_id, sid)
+    _require_project_manager(entity_id, sid)
 
-    db.first_or_404(select(Entity).filter_by(id=sid, entity_type="project"))
+    project = db.first_or_404(select(Entity).filter_by(id=sid, entity_type="project"))
 
+    # Lock the target's membership row so the role checked below cannot change
+    # under a concurrent promotion (no-op on SQLite).
     target_assoc = db.session.execute(
-        select(EntityManager).filter_by(user_entity_id=uid, project_entity_id=sid)
+        select(EntityManager)
+        .filter_by(user_entity_id=uid, project_entity_id=sid)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     ).scalar_one_or_none()
     if not target_assoc:
         return jsonify({"error": "Not found"}), HTTPStatus.NOT_FOUND
 
-    if target_assoc.is_owner:
+    db.session.refresh(project)
+    if project.owner_entity_id == uid:
+        db.session.rollback()
         return jsonify({"error": "Transfer ownership before removing the owner"}), HTTPStatus.CONFLICT
 
+    if target_assoc.role == "manager" and not _can_administer(entity_id, sid):
+        db.session.rollback()
+        return jsonify({"error": "Only the owner can remove managers"}), HTTPStatus.FORBIDDEN
+
     db.session.delete(target_assoc)
-    db.session.commit()
+    try:
+        db.session.commit()
+    except IntegrityError:
+        # fk_entities_owner_membership: ownership moved to this user concurrently.
+        db.session.rollback()
+        return jsonify({"error": "Transfer ownership before removing the owner"}), HTTPStatus.CONFLICT
     return "", HTTPStatus.NO_CONTENT
 
 
-@projects_bp.route("/projects/<int:sid>/owner/search")
+@projects_bp.route("/projects/<int:sid>/users/<int:uid>", methods=["PATCH"])
 @login_required
-def search_owner_candidates(sid):
-    """Managers of the project who could become its owner.
-
-    The Change Owner dialog searches here: only existing managers qualify
-    (ownership is a promotion, not an invitation), and the current owner is
-    excluded.
-    """
+def update_project_member(sid, uid):
+    """Promote a user to manager or demote a manager to user (owner or admin)."""
     entity_id = session["entity_id"]
     _require_project_admin(entity_id, sid)
-    db.first_or_404(select(Entity).filter_by(id=sid, entity_type="project"))
 
-    q = (request.args.get("q") or "").strip()
-    if len(q) < 2:
-        return jsonify({"entities": []})
+    project = db.first_or_404(select(Entity).filter_by(id=sid, entity_type="project"))
 
-    entities = db.session.execute(
-        select(Entity)
-        .join(EntityManager, EntityManager.user_entity_id == Entity.id)
-        .where(
-            EntityManager.project_entity_id == sid,
-            EntityManager.is_owner == False,  # noqa: E712 — SQL comparison, not a truth check
-            Entity.entity_type == "user",
-            Entity.active == True,  # noqa: E712 — SQL comparison, not a truth check
-            db.or_(Entity.email.ilike(f"%{q}%"), Entity.name.ilike(f"%{q}%")),
+    data = request.get_json() or {}
+    role = data.get("role")
+    if role not in _MEMBER_ROLES:
+        return jsonify({"error": "Role must be 'user' or 'manager'"}), HTTPStatus.BAD_REQUEST
+
+    # Lock the membership row so a concurrent transfer to this member, or a key
+    # they are creating, cannot interleave with a demotion (no-op on SQLite).
+    target_assoc = db.session.execute(
+        select(EntityManager)
+        .filter_by(user_entity_id=uid, project_entity_id=sid)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
+    if not target_assoc:
+        return jsonify({"error": "Not found"}), HTTPStatus.NOT_FOUND
+
+    db.session.refresh(project)
+    if project.owner_entity_id == uid and role != "manager":
+        db.session.rollback()
+        return jsonify({"error": "The owner cannot be demoted; transfer ownership first"}), HTTPStatus.CONFLICT
+
+    if role == "user":
+        # A user may hold one active key; refuse rather than revoke the extras.
+        active_keys = db.session.scalar(
+            select(func.count(APIKey.id)).where(
+                APIKey.entity_id == sid,
+                APIKey.created_by_entity_id == uid,
+                APIKey.revoked_at.is_(None),
+            )
         )
-        .order_by(Entity.name)
-        .limit(10)
-    ).scalars().all()
-    return jsonify({
-        "entities": [
-            {"id": e.id, "name": e.name, "email": e.email, "type": e.entity_type}
-            for e in entities
-        ]
-    })
+        if active_keys > 1:
+            db.session.rollback()
+            return jsonify({
+                "error": f"This manager has {active_keys} active API keys and users can have only one; "
+                         "revoke the extra keys first",
+            }), HTTPStatus.CONFLICT
+
+    target_assoc.role = role
+    db.session.commit()
+    return jsonify({"user_id": uid, "role": role}), HTTPStatus.OK
 
 
 @projects_bp.route("/projects/<int:sid>/owner", methods=["POST"])
@@ -510,39 +611,46 @@ def transfer_ownership(sid):
     if not new_owner_id:
         return jsonify({"error": "user_id required"}), HTTPStatus.BAD_REQUEST
 
-    db.first_or_404(select(Entity).filter_by(id=sid, entity_type="project"))
+    project = db.first_or_404(select(Entity).filter_by(id=sid, entity_type="project"))
     new_owner = db.session.execute(
         select(Entity).filter_by(id=new_owner_id, entity_type="user")
     ).scalar_one_or_none()
     if not new_owner:
         return jsonify({"error": "User not found"}), HTTPStatus.NOT_FOUND
 
-    old_owner_assoc = db.session.execute(
-        select(EntityManager).filter_by(project_entity_id=sid, is_owner=True)
-    ).scalar_one_or_none()
-
+    # Lock the target's membership row so a concurrent demotion cannot leave
+    # a 'user' as owner (no-op on SQLite).
     new_assoc = db.session.execute(
-        select(EntityManager).filter_by(user_entity_id=new_owner_id, project_entity_id=sid)
+        select(EntityManager)
+        .filter_by(user_entity_id=new_owner.id, project_entity_id=sid)
+        .with_for_update()
     ).scalar_one_or_none()
-    if new_assoc is None:
+    if new_assoc is None or new_assoc.role != "manager":
         return jsonify(
             {"error": "The new owner must already be a manager of this project"}
         ), HTTPStatus.BAD_REQUEST
-    if new_assoc is old_owner_assoc:
+    # A non-admin was authorized as the owner, so only their ownership may be
+    # handed on: re-reading the pointer here could pick up an owner that a
+    # concurrent transfer installed after the authorization check.
+    entity = db.session.get(Entity, entity_id)
+    old_owner_id = project.owner_entity_id if is_admin(entity) else entity_id
+    if old_owner_id == new_owner.id:
         return jsonify({"error": "User is already the owner"}), HTTPStatus.CONFLICT
 
-    if old_owner_assoc:
-        # Demote and flush BEFORE promoting: SQLAlchemy flushes UPDATEs in
-        # primary-key order, so promoting a lower-id row first would
-        # transiently put two owners under the non-deferrable unique index.
-        old_owner_assoc.is_owner = False
-        db.session.flush()
-    new_assoc.is_owner = True
-
+    # Compare-and-set on the owner pointer: a concurrent transfer that
+    # committed first leaves no row matching the owner we read.
+    moved = db.session.execute(
+        update(Entity)
+        .where(Entity.id == sid, Entity.owner_entity_id == old_owner_id)
+        .values(owner_entity_id=new_owner.id)
+    ).rowcount
+    if moved != 1:
+        db.session.rollback()
+        return jsonify({"error": "Ownership changed concurrently; reload and try again"}), HTTPStatus.CONFLICT
     try:
         db.session.commit()
     except IntegrityError:
-        # uq_entity_managers_owner: a concurrent transfer committed first.
+        # fk_entities_owner_membership: the new owner was removed concurrently.
         db.session.rollback()
         return jsonify({"error": "Ownership changed concurrently; reload and try again"}), HTTPStatus.CONFLICT
     return jsonify({"owner_id": new_owner_id}), HTTPStatus.OK
@@ -552,8 +660,33 @@ def transfer_ownership(sid):
 @login_required
 def create_project_key(sid):
     entity_id = session["entity_id"]
-    db.first_or_404(select(Entity).filter_by(id=sid, entity_type="project"))
-    _require_project_access(entity_id, sid)
+    project = db.first_or_404(select(Entity).filter_by(id=sid, entity_type="project"))
+    admin = is_admin(db.session.get(Entity, entity_id))
+
+    # Authorize from the caller's locked membership row, not an earlier read:
+    # a removal that commits first leaves no row, so the caller is refused;
+    # concurrent creates cannot both pass the one-key check; and a demotion
+    # cannot interleave with a manager's create (the lock is a no-op on SQLite).
+    role = db.session.scalar(
+        select(EntityManager.role)
+        .filter_by(user_entity_id=entity_id, project_entity_id=sid)
+        .with_for_update()
+    )
+    if role is None and not admin:
+        db.session.rollback()
+        abort(HTTPStatus.FORBIDDEN)
+    db.session.refresh(project)
+    if not admin and role == "user" and project.owner_entity_id != entity_id:
+        has_key = db.session.scalar(
+            select(APIKey.id).where(
+                APIKey.entity_id == sid,
+                APIKey.created_by_entity_id == entity_id,
+                APIKey.revoked_at.is_(None),
+            ).limit(1)
+        )
+        if has_key is not None:
+            db.session.rollback()
+            return jsonify({"error": "Users can have only one API key"}), HTTPStatus.CONFLICT
 
     data = request.get_json() or {}
     name = (data.get("name") or "").strip()
@@ -567,7 +700,6 @@ def create_project_key(sid):
         entity_id=sid,
         created_by_entity_id=entity_id,
         name=name or "Unnamed Key",
-        active=True,
         **fields,
     )
     db.session.add(api_key)
@@ -578,15 +710,27 @@ def create_project_key(sid):
 
 @projects_bp.route("/projects/<int:sid>/keys/<int:kid>", methods=["DELETE"])
 @login_required
-def delete_project_key(sid, kid):
+def delete_project_key_removed(sid, kid):
+    # Keys are revoked, not deleted; answer the old URL with 405 instead of 404.
+    return jsonify({"error": "Use POST /projects/<sid>/keys/<id>/revoke"}), HTTPStatus.METHOD_NOT_ALLOWED
+
+
+@projects_bp.route("/projects/<int:sid>/keys/<int:kid>/revoke", methods=["POST"])
+@login_required
+def revoke_project_key(sid, kid):
     entity_id = session["entity_id"]
     _require_project_access(entity_id, sid)
 
     api_key = db.get_or_404(APIKey, kid)
     if api_key.entity_id != sid:
         return jsonify({"error": "Not found"}), HTTPStatus.NOT_FOUND
+    # 404, not 403: users cannot see other members' keys, so do not confirm they exist.
+    if _is_plain_user(entity_id, sid) and api_key.created_by_entity_id != entity_id:
+        return jsonify({"error": "Not found"}), HTTPStatus.NOT_FOUND
 
-    db.session.delete(api_key)
+    if api_key.revoked_at is None:
+        api_key.revoked_at = utcnow()
+        api_key.revoked_by_entity_id = entity_id
     db.session.commit()
     return "", HTTPStatus.NO_CONTENT
 
@@ -612,7 +756,8 @@ def rotate_project_key(sid, kid):
 def project_consent(sid, model_name):
     entity_id = session["entity_id"]
     db.first_or_404(select(Entity).filter_by(id=sid, entity_type="project"))
-    _require_project_access(entity_id, sid)
+    # Acknowledging a model binds the whole project, so plain users cannot.
+    _require_project_manager(entity_id, sid)
 
     config = db.first_or_404(select(ModelConfig).where(ModelConfig.model_name == model_name, ModelConfig.active))
 

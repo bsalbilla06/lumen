@@ -1,11 +1,14 @@
 """Tests for the projects blueprint (/projects/*)."""
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from http import HTTPStatus
 
 import pytest
 from sqlalchemy import func, select
+
+from lumen.timeutils import utcnow
+from tests.conftest import make_project
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -13,15 +16,10 @@ from sqlalchemy import func, select
 
 @pytest.fixture
 def service_project(app):
-    """An active service (project) entity."""
+    """An active service (project) entity, owned by a dedicated owner user."""
     with app.app_context():
-        from lumen.extensions import db
-        from lumen.models.entity import Entity
-        c = Entity(entity_type="project", name="test-svc", initials="TS", active=True)
-        db.session.add(c)
-        db.session.commit()
-        db.session.refresh(c)
-        return {"id": c.id, "name": c.name}
+        c = make_project("test-svc", initials="TS")
+        return {"id": c.id, "name": c.name, "owner_id": c.owner_entity_id}
 
 
 @pytest.fixture
@@ -40,17 +38,24 @@ def managed_project(app, service_project, test_user):
 
 @pytest.fixture
 def owned_project(app, service_project, test_user):
-    """service_project with test_user as owner (is_owner=True)."""
+    """service_project with test_user as its owner and only manager."""
     with app.app_context():
         from lumen.extensions import db
+        from lumen.models.entity import Entity
         from lumen.models.entity_manager import EntityManager
         db.session.add(EntityManager(
             user_entity_id=test_user["id"],
             project_entity_id=service_project["id"],
-            is_owner=True,
         ))
+        db.session.get(Entity, service_project["id"]).owner_entity_id = test_user["id"]
+        db.session.flush()
+        db.session.delete(db.session.execute(
+            select(EntityManager).filter_by(
+                user_entity_id=service_project["owner_id"], project_entity_id=service_project["id"],
+            )
+        ).scalar_one())
         db.session.commit()
-    return service_project
+    return {**service_project, "owner_id": test_user["id"]}
 
 
 @pytest.fixture
@@ -98,7 +103,6 @@ def make_api_key(app):
                 name=name,
                 key_hash=hash_api_key(raw_key),
                 key_hint=f"{raw_key[:8]}...{raw_key[-4:]}",
-                active=True,
             )
             db.session.add(key)
             db.session.commit()
@@ -435,10 +439,7 @@ def test_update_project_invalid_values_return_400(admin_client, service_project)
 
 def test_update_project_duplicate_name_returns_409(app, admin_client, service_project):
     with app.app_context():
-        from lumen.extensions import db
-        from lumen.models.entity import Entity
-        db.session.add(Entity(entity_type="project", name="other-svc", initials="OS", active=True))
-        db.session.commit()
+        make_project("other-svc", initials="OS")
     resp = admin_client.patch(f"/projects/{service_project['id']}", json={"name": "other-svc"})
     assert resp.status_code == HTTPStatus.CONFLICT
 
@@ -460,6 +461,22 @@ def test_projects_data_lists_active_project(admin_client, service_project):
     assert data["per_page"] == 25
     names = [c["name"] for c in data["projects"]]
     assert service_project["name"] in names
+
+
+def test_projects_data_manager_count_excludes_users(app, admin_client, managed_project, test_user):
+    """managers counts only role='manager' rows (the owner and test_user), not 'user' members."""
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity import Entity
+        from lumen.models.entity_manager import EntityManager
+        member = Entity(entity_type="user", email="member@example.com", name="Member", initials="ME", active=True)
+        db.session.add(member)
+        db.session.flush()
+        db.session.add(EntityManager(user_entity_id=member.id, project_entity_id=managed_project["id"], role="user"))
+        db.session.commit()
+    resp = admin_client.get("/projects/data")
+    row = next(c for c in resp.get_json()["projects"] if c["name"] == managed_project["name"])
+    assert row["managers"] == 2
 
 
 def test_projects_data_includes_disabled(admin_client, service_project):
@@ -566,9 +583,9 @@ def test_delete_project_soft_deletes(app, admin_client, service_project):
 # Manager management
 # ---------------------------------------------------------------------------
 
-def test_add_manager_requires_admin(managed_auth_client, managed_project):
-    resp = managed_auth_client.post(
-        f"/projects/{managed_project['id']}/users",
+def test_add_member_requires_membership(auth_client, service_project):
+    resp = auth_client.post(
+        f"/projects/{service_project['id']}/users",
         json={"email": "anyone@example.com"},
     )
     assert resp.status_code == HTTPStatus.FORBIDDEN
@@ -589,6 +606,7 @@ def test_add_manager_succeeds(app, admin_client, service_project, test_user):
             select(EntityManager).filter_by(user_entity_id=test_user["id"], project_entity_id=service_project["id"])
         ).scalar_one_or_none()
         assert assoc is not None
+        assert assoc.role == "user"  # role defaults to user
 
 
 def test_add_manager_unknown_email_returns_404(admin_client, service_project):
@@ -652,10 +670,10 @@ def test_create_project_with_owner(app, admin_client, test_user):
         from lumen.models.entity import Entity
         from lumen.models.entity_manager import EntityManager
         project = db.session.execute(select(Entity).filter_by(name="owned-svc", entity_type="project")).scalar_one()
-        assoc = db.session.execute(
+        assert project.owner_entity_id == test_user["id"]
+        assert db.session.execute(
             select(EntityManager).filter_by(user_entity_id=test_user["id"], project_entity_id=project.id)
-        ).scalar_one()
-        assert assoc.is_owner is True
+        ).scalar_one_or_none() is not None
 
 
 def test_create_project_owner_not_found_returns_404(admin_client):
@@ -666,9 +684,10 @@ def test_create_project_owner_not_found_returns_404(admin_client):
 def test_owner_can_add_manager(owner_auth_client, owned_project, second_user):
     resp = owner_auth_client.post(
         f"/projects/{owned_project['id']}/users",
-        json={"email": "second@example.com"},
+        json={"email": "second@example.com", "role": "manager"},
     )
     assert resp.status_code == HTTPStatus.CREATED
+    assert resp.get_json()["role"] == "manager"
 
 
 def test_owner_can_remove_manager(app, owner_auth_client, owned_project, second_user):
@@ -707,7 +726,7 @@ def test_non_owner_manager_cannot_toggle(managed_auth_client, managed_project):
 def test_non_owner_manager_cannot_add_manager(managed_auth_client, managed_project, second_user):
     resp = managed_auth_client.post(
         f"/projects/{managed_project['id']}/users",
-        json={"email": "second@example.com"},
+        json={"email": "second@example.com", "role": "manager"},
     )
     assert resp.status_code == HTTPStatus.FORBIDDEN
 
@@ -724,7 +743,6 @@ def test_transfer_ownership(app, owner_auth_client, owned_project, test_user, se
         db.session.add(EntityManager(
             user_entity_id=second_user["id"],
             project_entity_id=owned_project["id"],
-            is_owner=False,
         ))
         db.session.commit()
     resp = owner_auth_client.post(
@@ -734,15 +752,13 @@ def test_transfer_ownership(app, owner_auth_client, owned_project, test_user, se
     assert resp.status_code == HTTPStatus.OK
     with app.app_context():
         from lumen.extensions import db
+        from lumen.models.entity import Entity
         from lumen.models.entity_manager import EntityManager
-        old = db.session.execute(
+        assert db.session.get(Entity, owned_project["id"]).owner_entity_id == second_user["id"]
+        # The previous owner stays on as a manager.
+        assert db.session.execute(
             select(EntityManager).filter_by(user_entity_id=test_user["id"], project_entity_id=owned_project["id"])
-        ).scalar_one()
-        new = db.session.execute(
-            select(EntityManager).filter_by(user_entity_id=second_user["id"], project_entity_id=owned_project["id"])
-        ).scalar_one()
-        assert old.is_owner is False
-        assert new.is_owner is True
+        ).scalar_one_or_none() is not None
 
 
 def test_transfer_to_non_manager_rejected(app, owner_auth_client, owned_project, test_user, second_user):
@@ -755,11 +771,9 @@ def test_transfer_to_non_manager_rejected(app, owner_auth_client, owned_project,
     assert "must already be a manager" in resp.get_json()["error"]
     with app.app_context():
         from lumen.extensions import db
+        from lumen.models.entity import Entity
         from lumen.models.entity_manager import EntityManager
-        old = db.session.execute(
-            select(EntityManager).filter_by(user_entity_id=test_user["id"], project_entity_id=owned_project["id"])
-        ).scalar_one()
-        assert old.is_owner is True
+        assert db.session.get(Entity, owned_project["id"]).owner_entity_id == test_user["id"]
         assert db.session.execute(
             select(EntityManager).filter_by(user_entity_id=second_user["id"], project_entity_id=owned_project["id"])
         ).scalar_one_or_none() is None
@@ -797,16 +811,18 @@ def test_transfer_to_current_owner_returns_409(owner_auth_client, owned_project,
     assert resp.status_code == HTTPStatus.CONFLICT
 
 
-def test_admin_assigns_owner_to_ownerless_project(app, admin_client, service_project, second_user):
-    """An ownerless project gains an owner in two steps: add the user as a
-    manager, then promote them (also covers the no-previous-owner path)."""
+def test_admin_transfers_ownership_to_new_manager(app, admin_client, service_project, second_user):
+    """An admin hands a project to someone new in two steps: add the user as a
+    manager, then make them the owner."""
     resp = admin_client.post(
         f"/projects/{service_project['id']}/owner",
         json={"user_id": second_user["id"]},
     )
     assert resp.status_code == HTTPStatus.BAD_REQUEST  # not a manager yet
 
-    admin_client.post(f"/projects/{service_project['id']}/users", json={"email": second_user["email"]})
+    admin_client.post(
+        f"/projects/{service_project['id']}/users", json={"email": second_user["email"], "role": "manager"},
+    )
     resp = admin_client.post(
         f"/projects/{service_project['id']}/owner",
         json={"user_id": second_user["id"]},
@@ -814,13 +830,8 @@ def test_admin_assigns_owner_to_ownerless_project(app, admin_client, service_pro
     assert resp.status_code == HTTPStatus.OK
     with app.app_context():
         from lumen.extensions import db
-        from lumen.models.entity_manager import EntityManager
-        assoc = db.session.execute(
-            select(EntityManager).filter_by(
-                user_entity_id=second_user["id"], project_entity_id=service_project["id"]
-            )
-        ).scalar_one()
-        assert assoc.is_owner is True
+        from lumen.models.entity import Entity
+        assert db.session.get(Entity, service_project["id"]).owner_entity_id == second_user["id"]
 
 
 def test_plain_non_manager_forbidden_on_owner_routes(auth_client, service_project, second_user):
@@ -865,7 +876,7 @@ def test_create_key_succeeds(app, managed_auth_client, managed_project):
         from lumen.models.api_key import APIKey
         key = db.session.execute(select(APIKey).filter_by(entity_id=managed_project["id"], name="prod")).scalar_one_or_none()
         assert key is not None
-        assert key.active is True
+        assert key.revoked_at is None
 
 
 def test_create_key_duplicate_returns_409(managed_auth_client, managed_project):
@@ -925,32 +936,42 @@ def test_created_by_null_for_keys_made_without_a_creator(app, service_project, m
         assert key.created_by_entity_id is None
 
 
+def _delete_entity_enforcing_fks(app, entity_id):
+    """Delete an entity with SQLite FK enforcement on, so ON DELETE SET NULL runs.
+
+    SQLite enables FKs per connection, and the PRAGMA is ignored inside an open
+    transaction. Use a dedicated connection, check the PRAGMA took effect, and
+    invalidate the connection afterwards so enforcement can never leak into the
+    pooled connections later tests (and the autouse cleanup) reuse.
+    """
+    with app.app_context():
+        from sqlalchemy import delete
+
+        from lumen.extensions import db
+        from lumen.models.entity import Entity
+        conn = db.engine.connect()
+        try:
+            conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+            assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
+            conn.execute(delete(Entity).where(Entity.id == entity_id))
+            conn.commit()
+        finally:
+            conn.invalidate()
+            conn.close()
+
+
 def test_deleting_creator_keeps_key_with_null_creator(app, managed_auth_client, managed_project, test_user):
     resp = managed_auth_client.post(
         f"/projects/{managed_project['id']}/keys",
         json={"name": "orphan", "key": "sk_orphcreator123"},
     )
     assert resp.status_code == HTTPStatus.CREATED
+    _delete_entity_enforcing_fks(app, test_user["id"])
     with app.app_context():
-        from sqlalchemy import delete, text
-
         from lumen.extensions import db
         from lumen.models.api_key import APIKey
-        from lumen.models.entity import Entity
-        # SQLite only enforces FKs per connection; enable it to exercise the
-        # ON DELETE SET NULL clause the schema actually carries. The session
-        # fixture keeps this connection pooled for later tests, so the finally
-        # must hand it back with enforcement off, as it was found.
-        try:
-            db.session.execute(text("PRAGMA foreign_keys=ON"))
-            db.session.execute(delete(Entity).where(Entity.id == test_user["id"]))
-            db.session.commit()
-            key = db.session.execute(select(APIKey).filter_by(entity_id=managed_project["id"], name="orphan")).scalar_one()
-            assert key.created_by_entity_id is None
-        finally:
-            db.session.rollback()
-            db.session.execute(text("PRAGMA foreign_keys=OFF"))
-            db.session.commit()
+        key = db.session.execute(select(APIKey).filter_by(entity_id=managed_project["id"], name="orphan")).scalar_one()
+        assert key.created_by_entity_id is None
 
 
 def test_detail_shows_key_creator_and_unknown_for_legacy(managed_auth_client, managed_project, make_api_key):
@@ -981,7 +1002,7 @@ def test_detail_key_creator_falls_back_to_email(app, managed_auth_client, manage
         db.session.add(APIKey(
             entity_id=managed_project["id"], name="silent-key",
             created_by_entity_id=silent.id, key_hash=hash_api_key("sk_emailfallback1"),
-            key_hint="sk_emai...1234", active=True,
+            key_hint="sk_emai...1234",
         ))
         db.session.commit()
     page = managed_auth_client.get(f"/projects/{managed_project['id']}")
@@ -998,35 +1019,139 @@ def test_detail_key_table_has_sortable_created_by_column(managed_auth_client, ma
     assert "'requests','tokens','cost','last_used'" in html  # created_by not numeric → asc first click
 
 
-def test_delete_key_forbidden_for_non_manager(auth_client, service_project, make_api_key):
-    key_id, _ = make_api_key(service_project["id"], raw_key="sk_delkey1234567890", name="k")
-    resp = auth_client.delete(f"/projects/{service_project['id']}/keys/{key_id}")
+def test_revoke_key_forbidden_for_non_manager(auth_client, service_project, make_api_key):
+    key_id, _ = make_api_key(service_project["id"], raw_key="sk_revkey1234567890", name="k")
+    resp = auth_client.post(f"/projects/{service_project['id']}/keys/{key_id}/revoke")
     assert resp.status_code == HTTPStatus.FORBIDDEN
 
 
-def test_delete_key_soft_deletes(app, managed_auth_client, managed_project, make_api_key):
-    key_id, _ = make_api_key(managed_project["id"], raw_key="sk_todelete12345678", name="to-delete")
-    resp = managed_auth_client.delete(f"/projects/{managed_project['id']}/keys/{key_id}")
-    assert resp.status_code == HTTPStatus.NO_CONTENT
+def _key_state(app, key_id):
     with app.app_context():
         from lumen.extensions import db
         from lumen.models.api_key import APIKey
         k = db.session.get(APIKey, key_id)
-        assert k is None
+        assert k is not None
+        return k.revoked_at, k.revoked_by_entity_id, k.requests, k.input_tokens, k.output_tokens, k.audio_seconds, k.cost
+
+
+def test_revoke_key_sets_revoked_at(app, managed_auth_client, managed_project, test_user, make_created_key):
+    key_id = make_created_key(managed_project["id"], test_user["id"], "sk_torevoke12345678")
+    resp = managed_auth_client.post(f"/projects/{managed_project['id']}/keys/{key_id}/revoke")
+    assert resp.status_code == HTTPStatus.NO_CONTENT
+    revoked_at, revoked_by, *counters = _key_state(app, key_id)
+    assert abs(utcnow() - revoked_at) < timedelta(minutes=1)
+    assert revoked_by == test_user["id"]
+    assert counters == [9, 300, 120, 3, Decimal("2.250000")]
+
+
+def test_manager_revoking_member_key_records_revoker(app, managed_auth_client, managed_project, test_user,
+                                                     second_user, make_created_key):
+    key_id = make_created_key(managed_project["id"], second_user["id"], "sk_memberkey1234567")
+    resp = managed_auth_client.post(f"/projects/{managed_project['id']}/keys/{key_id}/revoke")
+    assert resp.status_code == HTTPStatus.NO_CONTENT
+    _, revoked_by, *_ = _key_state(app, key_id)
+    assert revoked_by == test_user["id"]
+
+
+def test_deleting_revoker_keeps_key_with_null_revoker(app, managed_auth_client, managed_project, test_user,
+                                                      second_user, make_created_key):
+    key_id = make_created_key(managed_project["id"], second_user["id"], "sk_orphrevoker1234")
+    resp = managed_auth_client.post(f"/projects/{managed_project['id']}/keys/{key_id}/revoke")
+    assert resp.status_code == HTTPStatus.NO_CONTENT
+    _delete_entity_enforcing_fks(app, test_user["id"])
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.api_key import APIKey
+        key = db.session.get(APIKey, key_id)
+        assert key is not None and key.revoked_at is not None
+        assert key.revoked_by_entity_id is None
+
+
+def test_revoked_project_key_is_rejected(client, managed_auth_client, managed_project, test_user, make_created_key):
+    raw = "sk_revoked401key123"
+    key_id = make_created_key(managed_project["id"], test_user["id"], raw)
+    headers = {"Authorization": f"Bearer {raw}"}
+    assert client.get("/v1/models", headers=headers).status_code == HTTPStatus.OK
+    managed_auth_client.post(f"/projects/{managed_project['id']}/keys/{key_id}/revoke")
+    assert client.get("/v1/models", headers=headers).status_code == HTTPStatus.UNAUTHORIZED
+
+
+def test_revoke_revoked_key_is_noop(app, managed_auth_client, managed_project, test_user, make_created_key):
+    key_id = make_created_key(managed_project["id"], test_user["id"], "sk_inactive12345678",
+                              revoked_at=datetime(2026, 9, 3, 8, 0))
+    before = _key_state(app, key_id)
+    resp = managed_auth_client.post(f"/projects/{managed_project['id']}/keys/{key_id}/revoke")
+    assert resp.status_code == HTTPStatus.NO_CONTENT
+    assert _key_state(app, key_id) == before
+
+
+def test_project_page_uses_revoke_wording(managed_auth_client, managed_project, make_api_key):
+    key_id, _ = make_api_key(managed_project["id"], raw_key="sk_wording12345678", name="k")
+    managed_auth_client.post(f"/projects/{managed_project['id']}/keys/{key_id}/revoke")
+    html = managed_auth_client.get(f"/projects/{managed_project['id']}").get_data(as_text=True)
+    assert "Show revoked keys" in html
+    assert 'revoke-key-btn' in html and '>Revoke</button>' in html
+    assert ">revoked</span>" in html and 'data-bs-title="Revoked ${' in html
+    assert "Show deleted keys" not in html
+    assert "delete-key-btn" not in html and ">Delete</button>" not in html
+
+
+def _key_row(client, project_id, key_id):
+    html = client.get(f"/projects/{project_id}").get_data(as_text=True)
+    row = re.search(r"\{\s*id: " + str(key_id) + r",.*?\}", html, re.S)
+    assert row is not None
+    return html, row.group(0)
+
+
+def test_revoked_badge_names_manager_revoker(managed_auth_client, managed_project, second_user, make_created_key):
+    key_id = make_created_key(managed_project["id"], second_user["id"], "sk_badgerevoker1234")
+    resp = managed_auth_client.post(f"/projects/{managed_project['id']}/keys/{key_id}/revoke")
+    assert resp.status_code == HTTPStatus.NO_CONTENT
+    html, row = _key_row(managed_auth_client, managed_project["id"], key_id)
+    assert 'revoked_by: "Test User"' in row
+    assert "${k.revoked_by ? ' by ' + escHtml(k.revoked_by) : ''}" in html
+
+
+def test_revoked_badge_without_revoker_has_no_name(managed_auth_client, managed_project, second_user, make_created_key):
+    key_id = make_created_key(managed_project["id"], second_user["id"], "sk_badgenobody1234",
+                              revoked_at=datetime(2026, 9, 3, 8, 0))
+    _, row = _key_row(managed_auth_client, managed_project["id"], key_id)
+    assert "revoked_by: null" in row
+
+
+def test_repeat_revoke_keeps_first_revoker(app, managed_auth_client, managed_project, test_user, second_user,
+                                           make_created_key):
+    key_id = make_created_key(managed_project["id"], test_user["id"], "sk_repeatrevoke1234",
+                              revoked_at=datetime(2026, 9, 3, 8, 0), revoked_by=second_user["id"])
+    before = _key_state(app, key_id)
+    resp = managed_auth_client.post(f"/projects/{managed_project['id']}/keys/{key_id}/revoke")
+    assert resp.status_code == HTTPStatus.NO_CONTENT
+    assert _key_state(app, key_id) == before
+    assert before[:2] == (datetime(2026, 9, 3, 8, 0), second_user["id"])
+
+
+def test_revoked_key_still_listed(managed_auth_client, managed_project, make_api_key):
+    key_id, _ = make_api_key(managed_project["id"], raw_key="sk_listed12345678", name="gone-key")
+    managed_auth_client.post(f"/projects/{managed_project['id']}/keys/{key_id}/revoke")
+    html = managed_auth_client.get(f"/projects/{managed_project['id']}").get_data(as_text=True)
+    row = re.search(r"\{\s*id: " + str(key_id) + r",.*?\}", html, re.S)
+    assert row is not None
+    assert '"gone-key"' in row.group(0)
+    assert re.search(r'revoked_at: "\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ"', row.group(0))
 
 
 @pytest.fixture
 def make_created_key(app):
     """Factory: create a key on a project with a given creator and usage stats. Returns key id."""
-    def _make(sid, creator_id, raw_key, active=True):
+    def _make(sid, creator_id, raw_key, revoked_at=None, revoked_by=None):
         with app.app_context():
             from lumen.extensions import db
             from lumen.models.api_key import APIKey
             from lumen.services.crypto import hash_api_key
             key = APIKey(
                 entity_id=sid, created_by_entity_id=creator_id, name="rot-key",
-                key_hash=hash_api_key(raw_key), key_hint=f"{raw_key[:7]}...{raw_key[-4:]}", active=active,
-                requests=9, input_tokens=300, output_tokens=120, audio_seconds=3,
+                key_hash=hash_api_key(raw_key), key_hint=f"{raw_key[:7]}...{raw_key[-4:]}", revoked_at=revoked_at,
+                revoked_by_entity_id=revoked_by, requests=9, input_tokens=300, output_tokens=120, audio_seconds=3,
                 cost=Decimal("2.250000"), last_used_at=datetime(2026, 9, 2, 8, 0),
                 created_at=datetime(2026, 8, 2, 7, 0),
             )
@@ -1049,7 +1174,7 @@ def test_rotate_project_key_by_creator_keeps_stats(app, client, managed_auth_cli
     old, new = "sk_rotold123456789", "sk_rotnew123456789"
     kid = make_created_key(managed_project["id"], test_user["id"], old)
     fields = ("requests", "input_tokens", "output_tokens", "audio_seconds", "cost",
-              "last_used_at", "name", "created_at", "created_by_entity_id", "entity_id", "active")
+              "last_used_at", "name", "created_at", "created_by_entity_id", "entity_id", "revoked_at")
 
     def snapshot():
         with app.app_context():
@@ -1110,12 +1235,7 @@ def test_rotate_project_key_forbidden_for_non_manager(app, auth_client, service_
 def test_rotate_project_key_from_other_project_returns_404(app, managed_auth_client, managed_project, test_user,
                                                            make_created_key):
     with app.app_context():
-        from lumen.extensions import db
-        from lumen.models.entity import Entity
-        other = Entity(entity_type="project", name="other-svc", initials="OS", active=True)
-        db.session.add(other)
-        db.session.commit()
-        other_id = other.id
+        other_id = make_project("other-svc", initials="OS").id
     kid = make_created_key(other_id, test_user["id"], "sk_otherproj123456")
     resp = managed_auth_client.post(f"/projects/{managed_project['id']}/keys/{kid}/rotate",
                                     json={"key": "sk_otherprojnew123"})
@@ -1123,7 +1243,8 @@ def test_rotate_project_key_from_other_project_returns_404(app, managed_auth_cli
 
 
 def test_rotate_project_key_inactive_returns_409(managed_auth_client, managed_project, test_user, make_created_key):
-    kid = make_created_key(managed_project["id"], test_user["id"], "sk_inactiverot1234", active=False)
+    kid = make_created_key(managed_project["id"], test_user["id"], "sk_inactiverot1234",
+                           revoked_at=datetime(2026, 9, 3, 8, 0))
     resp = managed_auth_client.post(f"/projects/{managed_project['id']}/keys/{kid}/rotate",
                                     json={"key": "sk_inactiverotnew1"})
     assert resp.status_code == HTTPStatus.CONFLICT
@@ -1175,7 +1296,8 @@ def test_detail_rotate_only_on_own_active_keys(app, managed_auth_client, managed
     _add_manager(app, managed_project["id"], second_user["id"])
     sid = managed_project["id"]
     own = make_created_key(sid, test_user["id"], "sk_ownrotui1234567")
-    own_inactive = make_created_key(sid, test_user["id"], "sk_owninactui12345", active=False)
+    own_inactive = make_created_key(sid, test_user["id"], "sk_owninactui12345",
+                                    revoked_at=datetime(2026, 9, 3, 8, 0))
     other = make_created_key(sid, second_user["id"], "sk_otherrotui12345")
     legacy = make_created_key(sid, None, "sk_legacyrotui1234")
 
@@ -1313,14 +1435,14 @@ def test_project_key_lists_accessible_model(
     assert test_model["model_name"] in ids
 
 
-def test_project_key_blocked_after_soft_delete(
+def test_project_key_blocked_after_revoke(
     client, managed_auth_client, managed_project, test_model_endpoint, unlimited_pool
 ):
-    """Key deactivated via DELETE /projects/<sid>/keys/<kid> returns 401."""
+    """Key revoked via POST /projects/<sid>/keys/<kid>/revoke returns 401."""
     # Create key
     resp = managed_auth_client.post(
         f"/projects/{managed_project['id']}/keys",
-        json={"name": "del-key", "key": "sk_deletekey12345678"},
+        json={"name": "rev-key", "key": "sk_revokekey12345678"},
     )
     assert resp.status_code == HTTPStatus.CREATED
     data = resp.get_json()
@@ -1330,8 +1452,8 @@ def test_project_key_blocked_after_soft_delete(
     resp = client.get("/v1/models", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == HTTPStatus.OK
 
-    # Soft-delete the key
-    resp = managed_auth_client.delete(f"/projects/{managed_project['id']}/keys/{kid}")
+    # Revoke the key
+    resp = managed_auth_client.post(f"/projects/{managed_project['id']}/keys/{kid}/revoke")
     assert resp.status_code == HTTPStatus.NO_CONTENT
 
     # Now it should be rejected
@@ -1359,44 +1481,731 @@ def test_project_key_no_pool_returns_403(
     assert resp.status_code == HTTPStatus.FORBIDDEN
 
 
-def test_owner_search_returns_only_managers(owner_auth_client, owned_project, second_user):
-    """The Change Owner dialog only offers existing managers, never outsiders."""
-    hits = owner_auth_client.get(f"/projects/{owned_project['id']}/owner/search?q=Second").get_json()["entities"]
-    assert hits == []
-    owner_auth_client.post(f"/projects/{owned_project['id']}/users", json={"email": second_user["email"]})
-    hits = owner_auth_client.get(f"/projects/{owned_project['id']}/owner/search?q=Second").get_json()["entities"]
-    assert [e["id"] for e in hits] == [second_user["id"]]
+def test_owner_search_route_removed(owner_auth_client, owned_project):
+    """The Change Owner dialog was replaced by per-row Make Owner buttons."""
+    resp = owner_auth_client.get(f"/projects/{owned_project['id']}/owner/search?q=Te")
+    assert resp.status_code == HTTPStatus.NOT_FOUND
 
 
-def test_owner_search_excludes_current_owner(owner_auth_client, owned_project, test_user):
-    hits = owner_auth_client.get(f"/projects/{owned_project['id']}/owner/search?q=Test").get_json()["entities"]
-    assert all(e["id"] != test_user["id"] for e in hits)
-
-
-def test_owner_search_requires_project_admin(managed_auth_client, managed_project):
-    resp = managed_auth_client.get(f"/projects/{managed_project['id']}/owner/search?q=Te")
-    assert resp.status_code == HTTPStatus.FORBIDDEN
-
-
-def test_two_project_owner_rows_rejected_by_db(app, owned_project, second_user):
-    """uq_entity_managers_owner makes the concurrent double-transfer impossible
-    to commit — without it, get_project_owner() raises for everyone afterwards."""
+def test_project_without_owner_rejected_by_db(app, owned_project):
+    """ck_entities_project_owner: a project can never lose its owner."""
     import pytest as _pytest
     from sqlalchemy.exc import IntegrityError
 
     with app.app_context():
         from lumen.extensions import db
-        from lumen.models.entity_manager import EntityManager
-        db.session.add(EntityManager(
-            user_entity_id=second_user["id"], project_entity_id=owned_project["id"], is_owner=True,
-        ))
+        from lumen.models.entity import Entity
+        db.session.get(Entity, owned_project["id"]).owner_entity_id = None
         with _pytest.raises(IntegrityError):
             db.session.commit()
         db.session.rollback()
 
 
 def test_project_transfer_to_manager_with_lower_row_id(app, owner_auth_client, owned_project, second_user):
-    owner_auth_client.post(f"/projects/{owned_project['id']}/users", json={"email": second_user["email"]})
+    owner_auth_client.post(
+        f"/projects/{owned_project['id']}/users", json={"email": second_user["email"], "role": "manager"},
+    )
     # second_user's row id is higher here; also cover the reverse by transferring twice
     r1 = owner_auth_client.post(f"/projects/{owned_project['id']}/owner", json={"user_id": second_user["id"]})
     assert r1.status_code == HTTPStatus.OK
+
+
+def test_transfer_by_stale_owner_conflicts(app, owner_auth_client, owned_project, test_user, second_user):
+    """Authorized as owner, but ownership moved before the update: the
+    caller's request must not hand on the new owner's project."""
+    from unittest.mock import patch
+
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity import Entity
+        from lumen.models.entity_manager import EntityManager
+        db.session.add(EntityManager(user_entity_id=second_user["id"], project_entity_id=owned_project["id"]))
+        third = Entity(entity_type="user", email="third@example.com", name="Third", initials="TH", active=True)
+        db.session.add(third)
+        db.session.flush()
+        db.session.add(EntityManager(user_entity_id=third.id, project_entity_id=owned_project["id"]))
+        # A concurrent transfer already made second_user the owner.
+        db.session.get(Entity, owned_project["id"]).owner_entity_id = second_user["id"]
+        db.session.commit()
+        third_id = third.id
+
+    # The authorization check ran before that transfer committed.
+    with patch("lumen.blueprints.projects.routes.is_project_owner", return_value=True):
+        resp = owner_auth_client.post(f"/projects/{owned_project['id']}/owner", json={"user_id": third_id})
+    assert resp.status_code == HTTPStatus.CONFLICT
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity import Entity
+        assert db.session.get(Entity, owned_project["id"]).owner_entity_id == second_user["id"]
+
+
+# ---------------------------------------------------------------------------
+# Member roles: owner / manager / user permission matrix
+# ---------------------------------------------------------------------------
+
+def _login_as(client, entity_id):
+    with client.session_transaction() as sess:
+        sess["entity_id"] = entity_id
+        sess.pop("admin_mode", None)
+    return client
+
+
+def _add_member(app, project_id, user_id, role):
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity_manager import EntityManager
+        db.session.add(EntityManager(user_entity_id=user_id, project_entity_id=project_id, role=role))
+        db.session.commit()
+
+
+def _member_role(app, project_id, user_id):
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity_manager import EntityManager
+        return db.session.scalar(
+            select(EntityManager.role).filter_by(user_entity_id=user_id, project_entity_id=project_id)
+        )
+
+
+@pytest.fixture
+def user_project(app, service_project, test_user):
+    """service_project with test_user as a plain member (role 'user')."""
+    _add_member(app, service_project["id"], test_user["id"], "user")
+    return service_project
+
+
+@pytest.fixture
+def user_auth_client(auth_client, user_project):
+    """auth_client with test_user holding the 'user' role in user_project."""
+    return auth_client
+
+
+def test_manager_can_add_and_remove_users(app, managed_auth_client, managed_project, second_user):
+    resp = managed_auth_client.post(
+        f"/projects/{managed_project['id']}/users", json={"email": second_user["email"]},
+    )
+    assert resp.status_code == HTTPStatus.CREATED
+    assert resp.get_json()["role"] == "user"
+    assert _member_role(app, managed_project["id"], second_user["id"]) == "user"
+
+    resp = managed_auth_client.delete(f"/projects/{managed_project['id']}/users/{second_user['id']}")
+    assert resp.status_code == HTTPStatus.NO_CONTENT
+    assert _member_role(app, managed_project["id"], second_user["id"]) is None
+
+
+def test_manager_can_search_users(managed_auth_client, managed_project):
+    resp = managed_auth_client.get(f"/projects/{managed_project['id']}/users/search?q=second")
+    assert resp.status_code == HTTPStatus.OK
+
+
+def test_manager_cannot_remove_manager(app, managed_auth_client, managed_project, second_user):
+    _add_member(app, managed_project["id"], second_user["id"], "manager")
+    resp = managed_auth_client.delete(f"/projects/{managed_project['id']}/users/{second_user['id']}")
+    assert resp.status_code == HTTPStatus.FORBIDDEN
+    assert _member_role(app, managed_project["id"], second_user["id"]) == "manager"
+
+
+def test_add_member_invalid_role_returns_400(owner_auth_client, owned_project, second_user):
+    resp = owner_auth_client.post(
+        f"/projects/{owned_project['id']}/users", json={"email": second_user["email"], "role": "owner"},
+    )
+    assert resp.status_code == HTTPStatus.BAD_REQUEST
+
+
+def test_admin_can_add_manager(app, admin_client, service_project, second_user):
+    resp = admin_client.post(
+        f"/projects/{service_project['id']}/users", json={"email": second_user["email"], "role": "manager"},
+    )
+    assert resp.status_code == HTTPStatus.CREATED
+    assert _member_role(app, service_project["id"], second_user["id"]) == "manager"
+
+
+def test_user_cannot_add_or_remove_members(app, user_auth_client, user_project, second_user):
+    resp = user_auth_client.post(
+        f"/projects/{user_project['id']}/users", json={"email": second_user["email"]},
+    )
+    assert resp.status_code == HTTPStatus.FORBIDDEN
+    assert _member_role(app, user_project["id"], second_user["id"]) is None
+
+    _add_member(app, user_project["id"], second_user["id"], "user")
+    resp = user_auth_client.delete(f"/projects/{user_project['id']}/users/{second_user['id']}")
+    assert resp.status_code == HTTPStatus.FORBIDDEN
+
+    resp = user_auth_client.get(f"/projects/{user_project['id']}/users/search?q=second")
+    assert resp.status_code == HTTPStatus.FORBIDDEN
+
+
+def test_owner_can_promote_and_demote(app, owner_auth_client, owned_project, second_user):
+    _add_member(app, owned_project["id"], second_user["id"], "user")
+    url = f"/projects/{owned_project['id']}/users/{second_user['id']}"
+
+    resp = owner_auth_client.patch(url, json={"role": "manager"})
+    assert resp.status_code == HTTPStatus.OK
+    assert _member_role(app, owned_project["id"], second_user["id"]) == "manager"
+
+    resp = owner_auth_client.patch(url, json={"role": "user"})
+    assert resp.status_code == HTTPStatus.OK
+    assert _member_role(app, owned_project["id"], second_user["id"]) == "user"
+
+
+def test_admin_can_promote(app, admin_client, service_project, second_user):
+    _add_member(app, service_project["id"], second_user["id"], "user")
+    resp = admin_client.patch(
+        f"/projects/{service_project['id']}/users/{second_user['id']}", json={"role": "manager"},
+    )
+    assert resp.status_code == HTTPStatus.OK
+    assert _member_role(app, service_project["id"], second_user["id"]) == "manager"
+
+
+def test_manager_cannot_promote_or_demote(app, managed_auth_client, managed_project, second_user, test_user):
+    _add_member(app, managed_project["id"], second_user["id"], "user")
+    resp = managed_auth_client.patch(
+        f"/projects/{managed_project['id']}/users/{second_user['id']}", json={"role": "manager"},
+    )
+    assert resp.status_code == HTTPStatus.FORBIDDEN
+    assert _member_role(app, managed_project["id"], second_user["id"]) == "user"
+
+    resp = managed_auth_client.patch(
+        f"/projects/{managed_project['id']}/users/{test_user['id']}", json={"role": "user"},
+    )
+    assert resp.status_code == HTTPStatus.FORBIDDEN
+    assert _member_role(app, managed_project["id"], test_user["id"]) == "manager"
+
+
+def test_user_cannot_promote_self(app, user_auth_client, user_project, test_user):
+    resp = user_auth_client.patch(
+        f"/projects/{user_project['id']}/users/{test_user['id']}", json={"role": "manager"},
+    )
+    assert resp.status_code == HTTPStatus.FORBIDDEN
+    assert _member_role(app, user_project["id"], test_user["id"]) == "user"
+
+
+def test_update_member_invalid_role_and_unknown_member(owner_auth_client, owned_project, second_user):
+    url = f"/projects/{owned_project['id']}/users/{second_user['id']}"
+    resp = owner_auth_client.patch(url, json={"role": "admin"})
+    assert resp.status_code == HTTPStatus.BAD_REQUEST
+    resp = owner_auth_client.patch(url, json={"role": "user"})
+    assert resp.status_code == HTTPStatus.NOT_FOUND
+
+
+def test_demoting_owner_returns_409(app, admin_client, owned_project, test_user):
+    resp = admin_client.patch(
+        f"/projects/{owned_project['id']}/users/{test_user['id']}", json={"role": "user"},
+    )
+    assert resp.status_code == HTTPStatus.CONFLICT
+    assert _member_role(app, owned_project["id"], test_user["id"]) == "manager"
+
+
+def test_removing_owner_returns_409_for_admin_and_manager(app, admin_client, managed_project, second_user):
+    owner_url = f"/projects/{managed_project['id']}/users/{managed_project['owner_id']}"
+    resp = admin_client.delete(owner_url)
+    assert resp.status_code == HTTPStatus.CONFLICT
+
+    _add_member(app, managed_project["id"], second_user["id"], "manager")
+    _login_as(admin_client, second_user["id"])
+    resp = admin_client.delete(owner_url)
+    assert resp.status_code == HTTPStatus.CONFLICT
+
+
+def test_transfer_ownership_to_user_rejected(app, owner_auth_client, owned_project, test_user, second_user):
+    _add_member(app, owned_project["id"], second_user["id"], "user")
+    resp = owner_auth_client.post(
+        f"/projects/{owned_project['id']}/owner", json={"user_id": second_user["id"]},
+    )
+    assert resp.status_code == HTTPStatus.BAD_REQUEST
+    assert "must already be a manager" in resp.get_json()["error"]
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity import Entity
+        assert db.session.get(Entity, owned_project["id"]).owner_entity_id == test_user["id"]
+
+
+def test_user_can_have_only_one_active_key(app, user_auth_client, user_project):
+    url = f"/projects/{user_project['id']}/keys"
+    first = user_auth_client.post(url, json={"name": "one", "key": "sk_userkey_one_1234"})
+    assert first.status_code == HTTPStatus.CREATED
+
+    second = user_auth_client.post(url, json={"name": "two", "key": "sk_userkey_two_1234"})
+    assert second.status_code == HTTPStatus.CONFLICT
+    assert second.get_json()["error"] == "Users can have only one API key"
+
+    resp = user_auth_client.post(f"{url}/{first.get_json()['id']}/revoke")
+    assert resp.status_code == HTTPStatus.NO_CONTENT
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.api_key import APIKey
+        assert db.session.get(APIKey, first.get_json()["id"]).revoked_at is not None
+
+    third = user_auth_client.post(url, json={"name": "three", "key": "sk_userkey_three_1234"})
+    assert third.status_code == HTTPStatus.CREATED
+
+
+def test_user_key_limit_ignores_inactive_and_other_members_keys(app, user_auth_client, user_project, test_user):
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.api_key import APIKey
+        db.session.add_all([
+            APIKey(entity_id=user_project["id"], created_by_entity_id=test_user["id"],
+                   name="old", key_hash="a" * 64, revoked_at=datetime(2026, 9, 3, 8, 0)),
+            APIKey(entity_id=user_project["id"], created_by_entity_id=user_project["owner_id"],
+                   name="owner", key_hash="b" * 64),
+        ])
+        db.session.commit()
+    resp = user_auth_client.post(
+        f"/projects/{user_project['id']}/keys", json={"name": "mine", "key": "sk_userkey_mine_1234"},
+    )
+    assert resp.status_code == HTTPStatus.CREATED
+
+
+def test_manager_can_create_many_keys(managed_auth_client, managed_project):
+    url = f"/projects/{managed_project['id']}/keys"
+    resp = managed_auth_client.post(url, json={"key": "sk_mgrkey_one_1234"})
+    assert resp.status_code == HTTPStatus.CREATED
+    resp = managed_auth_client.post(url, json={"key": "sk_mgrkey_two_1234"})
+    assert resp.status_code == HTTPStatus.CREATED
+
+
+def test_user_revoking_another_members_key_returns_404(app, user_auth_client, user_project, make_api_key):
+    kid, _ = make_api_key(user_project["id"], raw_key="sk_ownerkey_abcdef", name="owner-key")
+    resp = user_auth_client.post(f"/projects/{user_project['id']}/keys/{kid}/revoke")
+    assert resp.status_code == HTTPStatus.NOT_FOUND
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.api_key import APIKey
+        assert db.session.get(APIKey, kid) is not None
+
+
+def test_manager_can_revoke_any_key(app, managed_auth_client, managed_project, make_api_key):
+    kid, _ = make_api_key(managed_project["id"], raw_key="sk_ownerkey_abcdef", name="owner-key")
+    resp = managed_auth_client.post(f"/projects/{managed_project['id']}/keys/{kid}/revoke")
+    assert resp.status_code == HTTPStatus.NO_CONTENT
+
+
+def test_old_delete_key_url_returns_405(app, managed_auth_client, managed_project, make_api_key):
+    kid, _ = make_api_key(managed_project["id"], raw_key="sk_olddelete_abcdef", name="old-url-key")
+    resp = managed_auth_client.delete(f"/projects/{managed_project['id']}/keys/{kid}")
+    assert resp.status_code == HTTPStatus.METHOD_NOT_ALLOWED
+    assert _key_state(app, kid)[0] is None
+
+
+def test_old_delete_key_url_requires_login(client):
+    resp = client.delete("/projects/1/keys/1", follow_redirects=False)
+    assert resp.status_code == HTTPStatus.FOUND
+
+
+def _keys_on_page(client, project_id):
+    return client.get(f"/projects/{project_id}").get_data(as_text=True)
+
+
+def test_user_detail_shows_only_own_keys(app, user_auth_client, user_project, make_api_key):
+    make_api_key(user_project["id"], raw_key="sk_otherkey_zq9x", name="someone-elses-key")
+    user_auth_client.post(
+        f"/projects/{user_project['id']}/keys", json={"name": "my-own-key", "key": "sk_minekey_m7w3"},
+    )
+    page = _keys_on_page(user_auth_client, user_project["id"])
+    assert "my-own-key" in page
+    assert "sk_mine...m7w3" in page
+    assert "someone-elses-key" not in page
+    assert "zq9x" not in page
+
+
+def test_manager_and_owner_detail_show_all_keys(app, client, user_project, test_user, second_user, make_api_key):
+    make_api_key(user_project["id"], raw_key="sk_otherkey_zq9x", name="someone-elses-key")
+    _login_as(client, test_user["id"])
+    client.post(f"/projects/{user_project['id']}/keys", json={"name": "my-own-key", "key": "sk_minekey_m7w3"})
+
+    _add_member(app, user_project["id"], second_user["id"], "manager")
+    for viewer in (second_user["id"], user_project["owner_id"]):
+        page = _keys_on_page(_login_as(client, viewer), user_project["id"])
+        assert "my-own-key" in page
+        assert "someone-elses-key" in page
+
+
+def test_user_can_view_project_but_not_acknowledge_models(
+    app, user_auth_client, user_project, test_model, make_ack_access,
+):
+    resp = user_auth_client.get(f"/projects/{user_project['id']}")
+    assert resp.status_code == HTTPStatus.OK
+    make_ack_access(user_project["id"], test_model["id"])
+    resp = user_auth_client.post(f"/projects/{user_project['id']}/consent/{test_model['model_name']}")
+    assert resp.status_code == HTTPStatus.FORBIDDEN
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity_model_consent import EntityModelConsent
+        assert db.session.execute(
+            select(EntityModelConsent).filter_by(entity_id=user_project["id"])
+        ).scalar_one_or_none() is None
+
+
+@pytest.mark.parametrize("caller", ["manager", "owner", "admin"])
+def test_manager_owner_and_admin_can_acknowledge_models(
+    app, client, user_project, second_user, admin_user, test_model, make_ack_access, caller,
+):
+    _add_member(app, user_project["id"], second_user["id"], "manager")
+    caller_id = {"manager": second_user["id"], "owner": user_project["owner_id"], "admin": admin_user["id"]}[caller]
+    _login_as(client, caller_id)
+    if caller == "admin":
+        with client.session_transaction() as sess:
+            sess["admin_mode"] = True
+    make_ack_access(user_project["id"], test_model["id"])
+    resp = client.post(f"/projects/{user_project['id']}/consent/{test_model['model_name']}")
+    assert resp.status_code == HTTPStatus.OK
+
+
+def test_user_cannot_edit_or_toggle_project(user_auth_client, user_project):
+    resp = user_auth_client.post(f"/projects/{user_project['id']}/toggle")
+    assert resp.status_code == HTTPStatus.FORBIDDEN
+    resp = user_auth_client.patch(f"/projects/{user_project['id']}", json={"name": "renamed"})
+    assert resp.status_code == HTTPStatus.FORBIDDEN
+
+
+@pytest.mark.parametrize("role", ["", None, 0, "owner"])
+def test_add_member_explicit_invalid_role_returns_400(app, admin_client, service_project, second_user, role):
+    resp = admin_client.post(
+        f"/projects/{service_project['id']}/users", json={"email": second_user["email"], "role": role},
+    )
+    assert resp.status_code == HTTPStatus.BAD_REQUEST
+    assert _member_role(app, service_project["id"], second_user["id"]) is None
+
+
+def test_demoting_manager_with_several_active_keys_returns_409(app, owner_auth_client, owned_project, second_user):
+    _add_member(app, owned_project["id"], second_user["id"], "manager")
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.api_key import APIKey
+        db.session.add_all([
+            APIKey(entity_id=owned_project["id"], created_by_entity_id=second_user["id"],
+                   name=f"k{i}", key_hash=str(i) * 64)
+            for i in (1, 2)
+        ])
+        db.session.commit()
+    url = f"/projects/{owned_project['id']}/users/{second_user['id']}"
+    resp = owner_auth_client.patch(url, json={"role": "user"})
+    assert resp.status_code == HTTPStatus.CONFLICT
+    assert "2 active API keys" in resp.get_json()["error"]
+    assert "revoke the extra keys first" in resp.get_json()["error"]
+    assert _member_role(app, owned_project["id"], second_user["id"]) == "manager"
+
+
+def test_demoting_manager_with_one_active_key_succeeds(app, owner_auth_client, owned_project, second_user):
+    _add_member(app, owned_project["id"], second_user["id"], "manager")
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.api_key import APIKey
+        db.session.add_all([
+            APIKey(entity_id=owned_project["id"], created_by_entity_id=second_user["id"],
+                   name="live", key_hash="1" * 64),
+            APIKey(entity_id=owned_project["id"], created_by_entity_id=second_user["id"],
+                   name="old", key_hash="2" * 64, revoked_at=datetime(2026, 9, 3, 8, 0)),
+        ])
+        db.session.commit()
+    resp = owner_auth_client.patch(
+        f"/projects/{owned_project['id']}/users/{second_user['id']}", json={"role": "user"},
+    )
+    assert resp.status_code == HTTPStatus.OK
+    assert _member_role(app, owned_project["id"], second_user["id"]) == "user"
+
+
+def test_create_key_refused_when_membership_removed_before_lock(app, user_auth_client, user_project, test_user):
+    """A removal that commits before the membership lock is taken must not mint a key.
+
+    The listener deletes the caller's membership row just before the route's
+    locked SELECT on entity_managers runs, as a concurrent removal would.
+    """
+    from sqlalchemy import delete, event
+    from sqlalchemy.orm import Session
+
+    from lumen.models.entity_manager import EntityManager
+
+    removed = []
+
+    def remove_before_lock(state):
+        stmt = state.statement
+        if (not removed and state.is_select and stmt._for_update_arg is not None
+                and EntityManager.__table__ in stmt.get_final_froms()):
+            removed.append(True)
+            state.session.connection().execute(delete(EntityManager.__table__).where(
+                EntityManager.user_entity_id == test_user["id"],
+                EntityManager.project_entity_id == user_project["id"],
+            ))
+
+    event.listen(Session, "do_orm_execute", remove_before_lock)
+    try:
+        resp = user_auth_client.post(
+            f"/projects/{user_project['id']}/keys", json={"name": "late", "key": "sk_removedkey_1234"},
+        )
+    finally:
+        event.remove(Session, "do_orm_execute", remove_before_lock)
+
+    assert removed, "the route never took the membership lock"
+    assert resp.status_code == HTTPStatus.FORBIDDEN
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.api_key import APIKey
+        assert db.session.scalar(
+            select(func.count(APIKey.id)).where(APIKey.entity_id == user_project["id"])
+        ) == 0
+
+
+def test_user_sees_only_managers_owner_and_self(app, client, user_project, test_user, second_user, admin_user):
+    """U1 (test_user) and U2 are users; second_user is a manager. U1 sees the
+    owner, the manager and themselves but never U2; everyone else sees U2."""
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity import Entity
+        hidden = Entity(entity_type="user", email="hidden-u2@example.com", name="Hidden Member U2",
+                        initials="HU", active=True)
+        db.session.add(hidden)
+        db.session.commit()
+        hidden_id = hidden.id
+        owner = db.session.get(Entity, user_project["owner_id"])
+        owner_name, owner_email = owner.name, owner.email
+    _add_member(app, user_project["id"], hidden_id, "user")
+    _add_member(app, user_project["id"], second_user["id"], "manager")
+    url = f"/projects/{user_project['id']}"
+
+    page = _login_as(client, test_user["id"]).get(url).get_data(as_text=True)
+    assert "testuser@example.com" in page
+    assert owner_name in page and owner_email in page
+    assert second_user["name"] in page and second_user["email"] in page
+    assert "Hidden Member U2" not in page
+    assert "hidden-u2@example.com" not in page
+
+    for viewer in (second_user["id"], user_project["owner_id"], admin_user["id"]):
+        _login_as(client, viewer)
+        if viewer == admin_user["id"]:
+            with client.session_transaction() as sess:
+                sess["admin_mode"] = True
+        page = client.get(url).get_data(as_text=True)
+        assert "Hidden Member U2" in page
+        assert "hidden-u2@example.com" in page
+
+
+# ---------------------------------------------------------------------------
+# Members tab: each role sees only the actions it may take
+# ---------------------------------------------------------------------------
+
+def _members_page(client, project_id):
+    from bs4 import BeautifulSoup
+    return BeautifulSoup(client.get(f"/projects/{project_id}").data, "html.parser")
+
+
+def _action_labels(soup):
+    return {b.get("aria-label") for b in soup.select("#pane-members tbody button") if not b.has_attr("disabled")}
+
+
+@pytest.fixture
+def mixed_members(app, service_project, second_user):
+    """service_project with second_user as manager and a third user as plain user."""
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity import Entity
+        third = Entity(entity_type="user", email="third@example.com", name="Third User",
+                       initials="TU", active=True)
+        db.session.add(third)
+        db.session.commit()
+        third_id = third.id
+    _add_member(app, service_project["id"], second_user["id"], "manager")
+    _add_member(app, service_project["id"], third_id, "user")
+    return service_project
+
+
+def test_members_tab_owner_sees_all_actions(client, mixed_members):
+    soup = _members_page(_login_as(client, mixed_members["owner_id"]), mixed_members["id"])
+    assert soup.find(id="tab-members").get_text(strip=True) == "Members"
+    assert soup.find("button", attrs={"data-bs-target": "#addMemberModal"}).get_text(strip=True) == "+ Add User"
+    assert soup.find(id="changeOwnerModal") is None
+    assert [o["value"] for o in soup.select("#add-member-role option")] == ["user", "manager"]
+    assert _action_labels(soup) == {
+        "Make Second User owner", "Demote Second User to user", "Remove Second User",
+        "Promote Third User to manager", "Remove Third User",
+    }
+    owner_remove = soup.find("button", attrs={"aria-label": "Cannot remove yourself as owner"})
+    assert owner_remove.has_attr("disabled")
+    assert soup.find(id=owner_remove["aria-describedby"]).get_text(strip=True) == "Make another manager owner first"
+
+
+def test_members_tab_admin_sees_owner_actions(admin_client, mixed_members):
+    soup = _members_page(admin_client, mixed_members["id"])
+    assert [o["value"] for o in soup.select("#add-member-role option")] == ["user", "manager"]
+    assert soup.find(id="changeOwnerModal") is None
+    labels = _action_labels(soup)
+    assert "Demote Second User to user" in labels
+    assert {lbl for lbl in labels if lbl.startswith("Make ")} == {"Make Second User owner"}
+
+
+def test_members_tab_manager_can_only_add_and_remove_users(client, mixed_members, second_user):
+    soup = _members_page(_login_as(client, second_user["id"]), mixed_members["id"])
+    assert soup.find("button", attrs={"data-bs-target": "#addMemberModal"})
+    assert soup.find(id="changeOwnerModal") is None
+    assert soup.find(id="editProjectModal") is None
+    assert [o["value"] for o in soup.select("#add-member-role option")] == ["user"]
+    assert _action_labels(soup) == {"Remove Third User"}
+
+
+def test_members_tab_user_sees_no_member_actions(app, client, mixed_members):
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity import Entity
+        third_id = db.session.scalar(select(Entity.id).filter_by(email="third@example.com"))
+    soup = _members_page(_login_as(client, third_id), mixed_members["id"])
+    assert soup.find("button", attrs={"data-bs-target": "#addMemberModal"}) is None
+    assert soup.find(id="addMemberModal") is None
+    assert soup.find(id="add-member-role") is None
+    assert soup.select("#pane-members tbody button") == []
+    assert soup.find(id="changeOwnerModal") is None
+    roles = [td.get_text(strip=True) for td in soup.select("#pane-members tbody tr td:nth-of-type(3)")]
+    assert sorted(roles) == ["Manager", "Owner", "User"]
+
+
+def test_new_key_button_disabled_once_user_has_a_key(user_auth_client, user_project):
+    def new_key_button():
+        soup = _members_page(user_auth_client, user_project["id"])
+        return soup, soup.find("button", string=lambda t: t and "New API Key" in t)
+
+    soup, btn = new_key_button()
+    assert not btn.has_attr("disabled")
+    assert soup.find(id="key-limit-note") is None
+
+    resp = user_auth_client.post(f"/projects/{user_project['id']}/keys", json={"name": "k", "key": "sk_onlykey_0001"})
+    soup, btn = new_key_button()
+    assert btn.has_attr("disabled")
+    assert "only one active key; revoke it to create a new one" in soup.find(id=btn["aria-describedby"]).get_text()
+
+    user_auth_client.post(f"/projects/{user_project['id']}/keys/{resp.get_json()['id']}/revoke")
+    _, btn = new_key_button()
+    assert not btn.has_attr("disabled")
+
+
+def test_new_key_button_stays_enabled_for_managers(app, managed_auth_client, managed_project):
+    managed_auth_client.post(f"/projects/{managed_project['id']}/keys", json={"name": "k", "key": "sk_mgrkey_0001"})
+    soup = _members_page(managed_auth_client, managed_project["id"])
+    assert not soup.find("button", string=lambda t: t and "New API Key" in t).has_attr("disabled")
+
+
+def _member_names(soup):
+    return [td.get_text(strip=True) for td in soup.select("#pane-members tbody tr td:nth-of-type(1)")]
+
+
+def test_members_listed_owner_then_managers_then_users(app, client):
+    """Role order wins over name order; names sort A-Z within each role."""
+    from lumen.extensions import db
+    from lumen.models.entity import Entity
+    with app.app_context():
+        ids = {}
+        for name in ("Zed Owner", "Yan Manager", "Bob Manager", "Amy User", "Carl User"):
+            e = Entity(entity_type="user", email=f"{name.split()[0].lower()}@example.com", name=name,
+                       initials="XX", active=True)
+            db.session.add(e)
+            db.session.flush()
+            ids[name] = e.id
+        db.session.commit()
+        sid = make_project("ordered", owner_id=ids["Zed Owner"]).id
+    for name, role in (("Yan Manager", "manager"), ("Bob Manager", "manager"),
+                       ("Carl User", "user"), ("Amy User", "user")):
+        _add_member(app, sid, ids[name], role)
+
+    _login_as(client, ids["Zed Owner"])
+    assert _member_names(_members_page(client, sid)) == [
+        "Zed Owner", "Bob Manager", "Yan Manager", "Amy User", "Carl User",
+    ]
+
+    assert client.post(f"/projects/{sid}/owner", json={"user_id": ids["Yan Manager"]}).status_code == HTTPStatus.OK
+    assert _member_names(_members_page(client, sid)) == [
+        "Yan Manager", "Bob Manager", "Zed Owner", "Amy User", "Carl User",
+    ]
+
+
+def test_make_owner_only_on_manager_rows_for_owner_and_admin(app, client, admin_client, mixed_members, second_user):
+    def make_owner_labels(soup):
+        return {b["aria-label"] for b in soup.select("#pane-members tbody button") if b.get_text(strip=True) == "Make Owner"}
+
+    expected = {"Make Second User owner"}
+    assert make_owner_labels(_members_page(admin_client, mixed_members["id"])) == expected
+    assert make_owner_labels(_members_page(_login_as(client, mixed_members["owner_id"]), mixed_members["id"])) == expected
+    assert make_owner_labels(_members_page(_login_as(client, second_user["id"]), mixed_members["id"])) == set()
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity import Entity
+        third_id = db.session.scalar(select(Entity.id).filter_by(email="third@example.com"))
+    assert make_owner_labels(_members_page(_login_as(client, third_id), mixed_members["id"])) == set()
+
+
+def test_user_key_table_hides_created_by(app, client, user_project, test_user, second_user):
+    _login_as(client, test_user["id"])
+    client.post(f"/projects/{user_project['id']}/keys", json={"name": "mine", "key": "sk_minekey_h1d3"})
+    soup = _members_page(client, user_project["id"])
+    headers = [th.get_text(" ", strip=True) for th in soup.select("#key-table thead th")]
+    assert not any(h.startswith("Created By") for h in headers)
+    search = soup.find(id="key-search")
+    assert "creator" not in search["placeholder"] and "creator" not in search["aria-label"]
+    assert "Test User" not in soup.find("script", string=lambda t: t and "KEY_ROWS" in t).string
+
+    _add_member(app, user_project["id"], second_user["id"], "manager")
+    soup = _members_page(_login_as(client, second_user["id"]), user_project["id"])
+    headers = [th.get_text(" ", strip=True) for th in soup.select("#key-table thead th")]
+    assert any(h.startswith("Created By") for h in headers)
+    assert "creator" in soup.find(id="key-search")["placeholder"]
+
+
+def test_user_models_tab_has_no_ack_button(client, user_project, test_user, second_user, app):
+    _add_member(app, user_project["id"], second_user["id"], "manager")
+    page = _login_as(client, test_user["id"]).get(f"/projects/{user_project['id']}").get_data(as_text=True)
+    assert "ack-btn" not in page
+    assert "Needs consent: ask a project manager" in page
+    assert 'id="ackModal"' not in page
+
+    page = _login_as(client, second_user["id"]).get(f"/projects/{user_project['id']}").get_data(as_text=True)
+    assert "ack-btn" in page
+    assert 'id="ackModal"' in page
+
+
+def test_user_sees_self_owner_and_managers_only(app, client, mixed_members, second_user):
+    """Plain users do not see the other users; the Members stat matches the rows shown."""
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity import Entity
+        other = Entity(entity_type="user", email="other@example.com", name="Other User",
+                       initials="OU", active=True)
+        db.session.add(other)
+        db.session.commit()
+        other_id = other.id
+        third_id = db.session.scalar(select(Entity.id).filter_by(email="third@example.com"))
+    _add_member(app, mixed_members["id"], other_id, "user")
+
+    soup = _members_page(_login_as(client, third_id), mixed_members["id"])
+    assert _member_names(soup) == ["Owner of test-svc", "Second User", "Third User"]
+    stat = soup.find("div", string="Members").find_next_sibling("div").get_text(strip=True)
+    assert int(stat) == len(_member_names(soup))
+
+    soup = _members_page(_login_as(client, second_user["id"]), mixed_members["id"])
+    assert _member_names(soup) == ["Owner of test-svc", "Second User", "Other User", "Third User"]
+    assert soup.find("div", string="Members").find_next_sibling("div").get_text(strip=True) == "4"
+
+
+def _owner_row(soup):
+    return next(tr for tr in soup.select("#pane-members tbody tr")
+                if tr.select("td")[2].get_text(strip=True) == "Owner")
+
+
+def test_owner_row_remove_cell_per_role(client, admin_client, mixed_members, second_user):
+    sid = mixed_members["id"]
+    # admin_client and client are the same test client, so check the admin view first.
+    for login, label in (
+        (lambda: admin_client, "Cannot remove owner Owner of test-svc"),
+        (lambda: _login_as(client, mixed_members["owner_id"]), "Cannot remove yourself as owner"),
+    ):
+        viewer = login()
+        page = viewer.get(f"/projects/{sid}").get_data(as_text=True)
+        assert "Transfer ownership first" not in page
+        soup = _members_page(viewer, sid)
+        btn = _owner_row(soup).find("button")
+        assert btn.has_attr("disabled") and btn["aria-label"] == label
+        assert soup.find(id=btn["aria-describedby"]).get_text(strip=True) == "Make another manager owner first"
+
+    manager = _login_as(client, second_user["id"])
+    page = manager.get(f"/projects/{sid}").get_data(as_text=True)
+    assert "Transfer ownership first" not in page
+    assert "Make another manager owner first" not in page
+    soup = _members_page(manager, sid)
+    assert _owner_row(soup).find("button") is None

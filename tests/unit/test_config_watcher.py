@@ -143,6 +143,7 @@ def test_watcher_reloads_config_on_mtime_change(app, tmp_path, restore_config):
 @pytest.mark.parametrize(("bad_data", "expected_error"), [
     ({"version": 2, "app": {"name": "OldVersion"}}, "version: 3"),
     ({"version": 3, "groups": {}, "app": {"name": "RemovedPolicy"}}, "groups:"),
+    ({"version": 3, "api": {"consent": False}, "app": {"name": "RemovedConsent"}}, "api.consent"),
 ])
 def test_watcher_skips_invalid_config(
     app, tmp_path, restore_config, caplog, bad_data, expected_error,
@@ -430,6 +431,34 @@ def test_create_app_refuses_removed_config_keys(tmp_path, monkeypatch, capsys):
         create_app()
     error = capsys.readouterr().err
     assert "removed key 'groups:'" in error
+    assert "App cannot start" in error
+
+
+@pytest.mark.parametrize("consent", [True, False, None])
+def test_create_app_refuses_removed_api_consent(tmp_path, monkeypatch, capsys, consent):
+    """api.consent no longer exists; any value, even true, stops startup."""
+    import yaml as _yaml
+
+    cfg = tmp_path / "removed-consent.yaml"
+    cfg.write_text(_yaml.dump({
+        "version": 3,
+        "api": {"consent": consent},
+        "models": [{
+            "name": "m",
+            "input_cost_per_million": 0,
+            "output_cost_per_million": 0,
+        }],
+    }))
+    import config as config_module
+
+    monkeypatch.setattr(config_module.Config, "CONFIG_YAML", str(cfg))
+    from lumen import create_app
+
+    with pytest.raises(SystemExit) as exc:
+        create_app()
+    assert exc.value.code not in (0, None)
+    error = capsys.readouterr().err
+    assert "api.consent" in error
     assert "App cannot start" in error
 
 
@@ -760,6 +789,29 @@ def test_shipped_config_example_has_llm_section(app, restore_config):
         assert app.config["LLM_READ_TIMEOUT"] == 300.0
         assert app.config["LLM_REQUEST_TIMEOUT"] == 600.0
         assert app.config["LLM_MAX_RETRIES"] == 1
+
+
+def test_shipped_config_example_has_no_removed_keys():
+    """config.yaml.example must not ship a key that startup rejects."""
+    from pathlib import Path
+
+    import yaml as _yaml
+
+    from lumen.services.config_watcher import removed_config_key_errors
+    root = Path(__file__).resolve().parents[2]
+    data = _yaml.safe_load((root / "config.yaml.example").read_text())
+    assert "consent" not in data["api"]
+    assert removed_config_key_errors(data) == []
+
+
+def test_apply_hot_config_does_not_set_api_consent(app, restore_config):
+    """The removed api.consent flag no longer maps to an app.config value."""
+    from lumen.services.config_watcher import apply_hot_config
+    with app.app_context():
+        apply_hot_config(app, {"version": 3, "api": {}})
+    assert not [k for k in app.config if "CONSENT" in k]
+
+
 # ---------------------------------------------------------------------------
 # validate_config_structure
 # ---------------------------------------------------------------------------
@@ -811,6 +863,23 @@ def test_validate_config_rejects_removed_default_model_access():
     assert any("defaults.models.access" in error for error in validate_config_structure(cfg))
 
 
+@pytest.mark.parametrize("consent", [True, False, None])
+def test_validate_config_rejects_removed_api_consent(consent):
+    from lumen.services.config_watcher import removed_config_key_errors, validate_config_structure
+    cfg = _valid_config()
+    cfg["api"] = {"consent": consent}
+    expected = "`api.consent` was removed; API requests always require model acknowledgment. Delete the key"
+    assert removed_config_key_errors(cfg) == [expected]
+    assert expected in validate_config_structure(cfg)
+
+
+def test_validate_config_accepts_api_without_consent():
+    from lumen.services.config_watcher import validate_config_structure
+    cfg = _valid_config()
+    cfg["api"] = {"prometheus": {"enabled": False}}
+    assert validate_config_structure(cfg) == []
+
+
 def test_validate_config_rejects_missing_version():
     from lumen.services.config_watcher import validate_config_structure
     cfg = _valid_config()
@@ -831,6 +900,21 @@ def test_validate_config_rejects_non_numeric_costs():
     cfg["models"][0]["input_cost_per_million"] = "cheap"
     errors = validate_config_structure(cfg)
     assert any("input_cost_per_million" in e for e in errors)
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_validate_config_accepts_boolean_auto_price(value):
+    from lumen.services.config_watcher import validate_config_structure
+    cfg = _valid_config()
+    cfg["models"][0]["auto_price"] = value
+    assert validate_config_structure(cfg) == []
+
+
+def test_validate_config_rejects_non_boolean_auto_price():
+    from lumen.services.config_watcher import validate_config_structure
+    cfg = _valid_config()
+    cfg["models"][0]["auto_price"] = "yes"
+    assert any("auto_price" in e for e in validate_config_structure(cfg))
 
 
 def test_validate_config_rejects_missing_costs():

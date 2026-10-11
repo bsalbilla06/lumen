@@ -26,7 +26,6 @@ from lumen.models.group_limit import GroupLimit
 from lumen.models.group_member import GroupMember
 from lumen.models.model_config import ModelConfig
 from lumen.models.model_endpoint import ModelEndpoint
-from lumen.models.model_group_access import ModelGroupAccess
 from lumen.models.model_stat import ModelStat
 from lumen.models.request_log import RequestLog
 from lumen.services.cost import calculate_cost
@@ -155,7 +154,6 @@ def upstream_call_bounds(*, streaming: bool):
 def _resolve_single_access(
     is_owner: bool,
     owner_entity_id,
-    granted: bool,
     model_needs_ack: bool = False,
     model_disabled: bool = False,
     model_early_access: bool = False,
@@ -166,14 +164,13 @@ def _resolve_single_access(
     - 'disabled' models and models past their end_date short-circuit to 'blocked'
       and cannot be overridden.
     - A model without an owner (owner_entity_id is None) is visible to everyone;
-      an owned model is visible only to its owner and to members of groups the
-      model has been granted to (granted).
+      an owned model is visible only to its owner.
     - 'needs_ack' means the model has acknowledgement requirements (needs_ack
       and/or early_access); these are model-level properties.
     """
     if model_disabled or (model_end_date is not None and model_end_date <= utcnow()):
         return "blocked"
-    if owner_entity_id is not None and not is_owner and not granted:
+    if owner_entity_id is not None and not is_owner:
         return "blocked"
     return "needs_ack" if (model_needs_ack or model_early_access) else "allowed"
 
@@ -210,7 +207,8 @@ def bulk_model_access_info(entity_id: int, model_config_ids: list) -> tuple:
     {model_config_id: "allowed"|"blocked"|"needs_ack"} and consent_map is a dict
     {model_config_id: acknowledged_at} for models where the entity has satisfied
     ALL of the model's acknowledgement requirements (needs_ack and early_access);
-    the value is the most recent acknowledgement timestamp.
+    the value is the most recent acknowledgement timestamp. A model without an
+    owner is public; an owned model is allowed only for its owner.
 
     Issues a fixed set of queries regardless of the number of models — replaces N+1
     per-model calls to get_model_access_status / has_model_consent.
@@ -231,20 +229,6 @@ def bulk_model_access_info(entity_id: int, model_config_ids: list) -> tuple:
     unknown = set(model_config_ids) - baseline.keys()
     if unknown:
         raise ValueError(f"unknown model_config_id(s): {sorted(unknown)}")
-
-    # Group grants only matter for owned models the entity does not own itself.
-    granted_ids: set = set()
-    if any(r.owner_entity_id is not None and r.owner_entity_id != entity_id for r in baseline.values()):
-        group_ids = _get_active_group_ids(entity_id)
-        if group_ids:
-            granted_ids = {
-                mc_id for (mc_id,) in db.session.execute(
-                    select(ModelGroupAccess.model_config_id).where(
-                        ModelGroupAccess.group_id.in_(group_ids),
-                        ModelGroupAccess.model_config_id.in_(model_config_ids),
-                    )
-                ).all()
-            }
 
     # Only models whose acknowledgement requirements are ALL satisfied appear in
     # consent_map; a requirement added after consent leaves its timestamp NULL,
@@ -268,7 +252,6 @@ def bulk_model_access_info(entity_id: int, model_config_ids: list) -> tuple:
         access_statuses[mc_id] = _resolve_single_access(
             mc.owner_entity_id == entity_id,
             mc.owner_entity_id,
-            mc_id in granted_ids,
             model_needs_ack=mc.needs_ack,
             model_disabled=mc.disabled,
             model_early_access=mc.early_access,
@@ -325,7 +308,7 @@ def get_model_access_status(entity_id: int, model_config_id: int) -> str:
     Return 'allowed', 'blocked', or 'needs_ack' for the given entity + model.
 
     A model without an owner is allowed for everyone; an owned model is allowed
-    only for its owner and members of groups it has been granted to.
+    only for its owner.
     """
     access_statuses, _ = bulk_model_access_info(entity_id, [model_config_id])
     return access_statuses[model_config_id]
@@ -362,20 +345,19 @@ def model_notices(mc) -> tuple:
     return ack_notice, early_notice
 
 
-def get_model_access(entity_id: int, model_config_id: int, require_consent: bool = True) -> bool:
+def get_model_access(entity_id: int, model_config_id: int) -> bool:
     """
     Return True if entity can access the given model, False otherwise.
 
-    For models that require acknowledgement, requires prior consent (EntityModelConsent)
-    unless require_consent is False (used to exempt API requests from the consent gate).
+    For models that require acknowledgement (needs_ack and/or early_access), requires
+    prior consent (EntityModelConsent) covering every current requirement. There is
+    no way to skip this gate: chat and API requests are held to the same rule.
     """
     access_statuses, consent_map = bulk_model_access_info(entity_id, [model_config_id])
     status = access_statuses[model_config_id]
     if status == "blocked":
         return False
     if status == "needs_ack":
-        if not require_consent:
-            return True
         return model_config_id in consent_map
     return True
 
@@ -450,14 +432,15 @@ def entity_has_unlimited_pool(entity_id_column):
     return own_unlimited_exists | (~own_limit_exists & inherited_unlimited)
 
 
-def get_effective_limit(entity_id: int, model_config_id: int, require_consent: bool = True):
+def get_effective_limit(entity_id: int, model_config_id: int):
     """
     Return (max_coins, refresh_coins, starting_coins) or None if blocked/no access.
 
-    Checks model access first, then returns the entity's coin pool.
+    Checks model access (including acknowledgement) first, then returns the
+    entity's coin pool.
     max_coins == -2 means unlimited.
     """
-    if not get_model_access(entity_id, model_config_id, require_consent=require_consent):
+    if not get_model_access(entity_id, model_config_id):
         return None
     return get_pool_limit(entity_id)
 
@@ -507,19 +490,24 @@ def subtract_coins(entity_id: int, model_config_id: int, coin_cost: float, effec
     db.session.flush()
 
 
-def _denial_reason(entity_id: int, model_config_id: int, require_consent: bool) -> str:
+def _denial_reason(entity_id: int, model_config_id: int) -> str:
     """Return the 403 reason for an entity denied access to a model.
 
-    ``get_effective_limit`` collapses "blocked" and "requires an acknowledgement
-    nobody has given" into one None, and the taxonomy needs them apart: the
-    second is the caller's to fix by acknowledging, the first is not. Returns
+    ``get_effective_limit`` collapses "blocked", "no usable coin pool" and
+    "requires an acknowledgement nobody has given" into one None, and the
+    taxonomy needs them apart: the last is the caller's to fix by
+    acknowledging, the others are not. Pool eligibility is decided first: an
+    entity with no usable pool is refused by the acknowledge endpoint no
+    matter what it acknowledges, so labelling such a denial
+    ``needs_consent`` would send the caller chasing a 404. Returns
     "needs_consent" or "no_access". Never raises, for the same reason
     ``observe_rejection_quietly`` does not.
     """
     try:
+        if get_pool_limit(entity_id) is None:
+            return "no_access"
         if (
-            require_consent
-            and get_model_access_status(entity_id, model_config_id) == "needs_ack"
+            get_model_access_status(entity_id, model_config_id) == "needs_ack"
             and not has_model_consent(entity_id, model_config_id)
         ):
             return "needs_consent"
@@ -528,7 +516,7 @@ def _denial_reason(entity_id: int, model_config_id: int, require_consent: bool) 
     return "no_access"
 
 
-def check_coin_budget(entity_id: int, model_config_id: int, require_consent: bool = True,
+def check_coin_budget(entity_id: int, model_config_id: int,
                       source: str = None, model_name: str = ""):
     """Check coin budget. Returns (ok, http_code, error_message, effective, reason).
 
@@ -552,9 +540,9 @@ def check_coin_budget(entity_id: int, model_config_id: int, require_consent: boo
     zeroed by subtract_coins afterward. This is intentional — the budget is a soft
     spending limit, not a hard reservation.
     """
-    effective = get_effective_limit(entity_id, model_config_id, require_consent=require_consent)
+    effective = get_effective_limit(entity_id, model_config_id)
     if effective is None:
-        reason = _denial_reason(entity_id, model_config_id, require_consent)
+        reason = _denial_reason(entity_id, model_config_id)
         if source:
             observe_rejection_quietly(reason, source, model_name)
         return False, HTTPStatus.FORBIDDEN, "No access to this model", None, reason

@@ -1,12 +1,61 @@
+/* ── Full-height pages (body.fill-viewport) ──────────────────── */
+/* The theme wrapper is exactly one screen tall and the page content takes what
+   the header and banner leave, so the page scrolls inside itself instead of
+   measuring offsets in JS. On screens too short for the content's own minimum
+   (landscape phones) the content spills and the page scrolls. The footer sits
+   just below the fold from md up and is hidden on phones; Help and Log Out
+   stay reachable from the header nav. */
+body.fill-viewport > :has(> #main-content) {
+    position: relative;
+    height: 100vh;
+    height: 100dvh;
+    min-height: 0 !important; /* themes set min-height:100vh inline */
+}
+body.fill-viewport #main-content,
+body.fill-viewport #main-content > .container-fluid {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    overflow: visible !important;
+}
+/* Size the content from the space it is given, never from what it holds. */
+body.fill-viewport #main-content {
+    contain: size;
+}
+body.fill-viewport > :has(> #main-content) > footer {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+}
+@media (max-width: 767.98px) {
+    body.fill-viewport > :has(> #main-content) > footer {
+        display: none;
+    }
+}
+
 /* ── Chat page layout ────────────────────────────────────────── */
 .chat-page-layout {
     display: flex;
-    height: calc(100vh - var(--chat-top, 200px) - 100px);
+    flex: 1;
+    min-height: 320px;
     overflow: auto;
     margin: 0 -1.5rem;
 }
+/* Bleed to the edges of the shell container, whose side padding is px-2 below md. */
+@media (max-width: 767.98px) {
+    .chat-page-layout {
+        margin: 0 -0.5rem;
+    }
+}
 
+/* Size both columns from the row, not from their content: with flex-basis auto
+   a long streamed line inflated .chat-main's basis and squeezed the sidebar,
+   so the layout shifted while a reply streamed. !important beats Bootstrap's
+   flex-fill (flex: 1 1 auto !important) on the same element. */
 .chat-main {
+    flex: 1 1 0 !important;
     min-width: 0;
     min-height: 0;
 }
@@ -50,6 +99,13 @@
     opacity: 1;
 }
 
+/* Touch screens have no hover to reveal it. */
+@media (hover: none) {
+    .conv-remove-btn {
+        opacity: 1;
+    }
+}
+
 /* ── Desktop: offcanvas becomes static sidebar ───────────────── */
 @media (min-width: 768px) {
     .chat-sidebar.offcanvas {
@@ -57,6 +113,7 @@
         transform: none !important;
         visibility: visible !important;
         width: 260px !important;
+        flex: 0 0 260px;
         height: 100%;
         border-right: 1px solid #dee2e6;
         z-index: auto;
@@ -67,6 +124,24 @@
     .chat-sidebar.offcanvas-start {
         top: auto;
         left: auto;
+    }
+}
+
+/* Model picker: on phones it takes the rest of its row and the ack warning
+   wraps onto its own line below it. */
+#model-picker {
+    flex: 1 1 0;
+    min-width: 0;
+}
+.chat-header .ack-warning {
+    flex-basis: 100%;
+}
+@media (min-width: 576px) {
+    #model-picker {
+        flex: 0 1 280px;
+    }
+    .chat-header .ack-warning {
+        flex-basis: auto;
     }
 }
 
@@ -401,7 +476,7 @@ ilw-content .btn-primary:active {
     border-radius: 999px;
     padding: 0.2rem 0.6rem;
     font-size: 0.8rem;
-    max-width: 280px;
+    max-width: min(280px, 100%);
 }
 .attach-chip .chip-name {
     overflow: hidden;
@@ -436,7 +511,7 @@ ilw-content .btn-primary:active {
 
 /* Inline image in user bubble */
 .bubble-img {
-    max-width: 220px;
+    max-width: min(220px, 100%);
     max-height: 160px;
     border-radius: 6px;
     display: block;
@@ -467,6 +542,13 @@ ilw-content .btn-primary:active {
     border: 2px solid;
     border-radius: 0.375rem;
 }
+@media (max-width: 767.98px) {
+    .announcement-banner {
+        padding: 0.5rem 2.5rem;
+        margin: 0.5rem;
+        font-size: 1rem;
+    }
+}
 .announcement-dismiss {
     position: absolute;
     top: 50%;
@@ -486,6 +568,67 @@ ilw-content .btn-primary:active {
     opacity: 1;
     outline: 2px solid currentColor;
     border-radius: 0.25rem;
+}
+
+/* ── Toolbar search inputs ───────────────────────────────────── */
+/* Fill the toolbar row on phones; fixed width from sm up. */
+.search-input {
+    width: 100%;
+}
+@media (min-width: 576px) {
+    .search-input {
+        width: 220px;
+    }
+    .search-input.search-input-narrow {
+        width: 200px;
+    }
+}
+
+/* ── Tables ──────────────────────────────────────────────────── */
+/* Contain absolutely positioned descendants (e.g. .visually-hidden header
+   labels) so they cannot widen the page past the scroll box. */
+.table-responsive {
+    position: relative;
+}
+/* Edge-to-edge tables in cards: the card border closes the table, so the last
+   row's border would draw a second line inside the scroll box. */
+.card-body.p-0 > .table-responsive > .table > :last-child > tr:last-child > * {
+    border-bottom-width: 0;
+}
+
+/* ── Usage charts and heatmap ────────────────────────────────── */
+/* Chart.js fills this box (maintainAspectRatio: false): a fixed height on
+   phones, Chart.js's default 2:1 shape from md up. */
+.chart-box {
+    position: relative;
+    height: 220px;
+}
+@media (min-width: 768px) {
+    .chart-box {
+        height: auto;
+        aspect-ratio: 2;
+    }
+}
+/* The heatmap scrolls inside its card; the day column stays in view. */
+#heatmap-container {
+    scroll-padding-left: 2.5rem;
+}
+#heatmap-table tr > :first-child {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: var(--bs-body-bg, #fff);
+}
+/* Below lg the heatmap card is narrow: keep cells big enough to tap and
+   scroll the grid instead of squeezing it. */
+@media (max-width: 991.98px) {
+    #heatmap-table td {
+        min-width: 1.5rem;
+    }
+}
+#heatmap-table td:focus-visible {
+    outline: 2px solid #000;
+    outline-offset: -2px;
 }
 
 /* ── Misc ────────────────────────────────────────────────────── */

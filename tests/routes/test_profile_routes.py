@@ -1,10 +1,13 @@
 """Tests for the profile blueprint routes."""
 import json
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 from decimal import Decimal
 from http import HTTPStatus
 
 import pytest
+
+from lumen.timeutils import utcnow
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -73,13 +76,8 @@ def test_profile_page_with_no_endpoints(app, auth_client, test_model):
 
 def test_project_profile_page_redirects(app, auth_client):
     with app.app_context():
-        from lumen.extensions import db
-        from lumen.models.entity import Entity
-        svc = Entity(entity_type="project", name="svc", initials="SV", active=True)
-        db.session.add(svc)
-        db.session.commit()
-        db.session.refresh(svc)
-        sid = svc.id
+        from tests.conftest import make_project
+        sid = make_project("svc", initials="SV").id
 
     resp = auth_client.get(f"/profile/project/{sid}", follow_redirects=False)
     assert resp.status_code == HTTPStatus.MOVED_PERMANENTLY
@@ -179,24 +177,112 @@ def test_create_key_requires_login(client):
 
 
 # ---------------------------------------------------------------------------
-# delete_key
+# revoke_key
 # ---------------------------------------------------------------------------
 
-def test_delete_key_success(app, auth_client, test_user):
+def test_revoke_key_success(app, auth_client, test_user):
     key = "sk_" + "d" * 32
     create_resp = auth_client.post(
         "/profile/keys",
-        data=json.dumps({"name": "to delete", "key": key}),
+        data=json.dumps({"name": "to revoke", "key": key}),
         content_type="application/json",
     )
     kid = create_resp.get_json()["id"]
 
-    resp = auth_client.delete(f"/profile/keys/{kid}")
+    resp = auth_client.post(f"/profile/keys/{kid}/revoke")
     assert resp.status_code == HTTPStatus.NO_CONTENT
 
 
-def test_delete_key_forbidden(app, auth_client, admin_user):
-    """Key owned by admin_user cannot be deleted by auth_client (test_user)."""
+def _make_personal_key(app, entity_id, raw, revoked_at=None, revoked_by=None):
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.api_key import APIKey
+        from lumen.services.crypto import hash_api_key
+        ak = APIKey(
+            entity_id=entity_id, created_by_entity_id=entity_id, name="usage key",
+            key_hash=hash_api_key(raw), key_hint=f"{raw[:8]}...{raw[-4:]}", revoked_at=revoked_at,
+            revoked_by_entity_id=revoked_by,
+            requests=9, input_tokens=300, output_tokens=120, audio_seconds=3, cost=Decimal("2.250000"),
+        )
+        db.session.add(ak)
+        db.session.commit()
+        return ak.id
+
+
+def _personal_key_state(app, kid):
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.api_key import APIKey
+        k = db.session.get(APIKey, kid)
+        assert k is not None
+        return k.revoked_at, k.revoked_by_entity_id, k.requests, k.input_tokens, k.output_tokens, k.audio_seconds, k.cost
+
+
+def test_revoke_key_sets_revoked_at(app, auth_client, test_user):
+    kid = _make_personal_key(app, test_user["id"], "sk_" + "s" * 32)
+    resp = auth_client.post(f"/profile/keys/{kid}/revoke")
+    assert resp.status_code == HTTPStatus.NO_CONTENT
+    revoked_at, revoked_by, *counters = _personal_key_state(app, kid)
+    assert abs(utcnow() - revoked_at) < timedelta(minutes=1)
+    assert revoked_by == test_user["id"]
+    assert counters == [9, 300, 120, 3, Decimal("2.250000")]
+
+
+def test_revoke_revoked_key_is_noop(app, auth_client, test_user):
+    kid = _make_personal_key(app, test_user["id"], "sk_" + "i" * 32, revoked_at=datetime(2026, 9, 2, 8, 0))
+    before = _personal_key_state(app, kid)
+    resp = auth_client.post(f"/profile/keys/{kid}/revoke")
+    assert resp.status_code == HTTPStatus.NO_CONTENT
+    assert _personal_key_state(app, kid) == before
+
+
+def test_profile_page_uses_revoke_wording(app, auth_client, test_user):
+    _make_personal_key(app, test_user["id"], "sk_" + "w" * 32, revoked_at=datetime(2026, 9, 2, 8, 0))
+    html = auth_client.get("/profile").get_data(as_text=True)
+    assert "Show revoked keys" in html
+    assert 'revoke-key-btn' in html and '>Revoke</button>' in html
+    assert ">revoked</span>" in html and 'data-bs-title="Revoked ${' in html
+    assert 'revoked_at: "2026-09-02T08:00:00Z"' in html
+    assert "Show deleted keys" not in html
+    assert "delete-key-btn" not in html and ">Delete</button>" not in html
+
+
+def test_profile_badge_names_revoker(app, auth_client, test_user):
+    kid = _make_personal_key(app, test_user["id"], "sk_" + "n" * 32)
+    assert auth_client.post(f"/profile/keys/{kid}/revoke").status_code == HTTPStatus.NO_CONTENT
+    html = auth_client.get("/profile").get_data(as_text=True)
+    assert re.search(r"id: " + str(kid) + r",.*?revoked_by: \"Test User\"", html, re.S)
+    assert "${k.revoked_by ? ' by ' + escHtml(k.revoked_by) : ''}" in html
+
+
+def test_profile_badge_without_revoker_has_no_name(app, auth_client, test_user):
+    kid = _make_personal_key(app, test_user["id"], "sk_" + "m" * 32, revoked_at=datetime(2026, 9, 2, 8, 0))
+    html = auth_client.get("/profile").get_data(as_text=True)
+    row = re.search(r"\{\s*id: " + str(kid) + r",.*?\}", html, re.S)
+    assert row is not None and "revoked_by: null" in row.group(0)
+
+
+def test_repeat_revoke_keeps_first_revoker(app, auth_client, test_user, admin_user):
+    kid = _make_personal_key(app, test_user["id"], "sk_" + "r" * 32,
+                             revoked_at=datetime(2026, 9, 2, 8, 0), revoked_by=admin_user["id"])
+    before = _personal_key_state(app, kid)
+    assert auth_client.post(f"/profile/keys/{kid}/revoke").status_code == HTTPStatus.NO_CONTENT
+    assert _personal_key_state(app, kid) == before
+    assert before[:2] == (datetime(2026, 9, 2, 8, 0), admin_user["id"])
+
+
+def test_revoked_key_is_rejected(app, client, auth_client, test_user):
+    raw = "sk_" + "z" * 32
+    kid = _make_personal_key(app, test_user["id"], raw)
+    headers = {"Authorization": f"Bearer {raw}"}
+    assert client.get("/v1/models", headers=headers).status_code == HTTPStatus.OK
+    resp = auth_client.post(f"/profile/keys/{kid}/revoke")
+    assert resp.status_code == HTTPStatus.NO_CONTENT
+    assert client.get("/v1/models", headers=headers).status_code == HTTPStatus.UNAUTHORIZED
+
+
+def test_revoke_key_forbidden(app, auth_client, admin_user):
+    """Key owned by admin_user cannot be revoked by auth_client (test_user)."""
     with app.app_context():
         from lumen.extensions import db
         from lumen.models.api_key import APIKey
@@ -207,23 +293,34 @@ def test_delete_key_forbidden(app, auth_client, admin_user):
             name="admin key",
             key_hash=hash_api_key(raw),
             key_hint="sk_eeeee...eeee",
-            active=True,
         )
         db.session.add(ak)
         db.session.commit()
         db.session.refresh(ak)
         kid = ak.id
 
-    resp = auth_client.delete(f"/profile/keys/{kid}")
+    resp = auth_client.post(f"/profile/keys/{kid}/revoke")
     assert resp.status_code == HTTPStatus.FORBIDDEN
 
 
-def test_delete_key_not_found(auth_client):
-    resp = auth_client.delete("/profile/keys/999999")
+def test_revoke_key_not_found(auth_client):
+    resp = auth_client.post("/profile/keys/999999/revoke")
     assert resp.status_code == HTTPStatus.NOT_FOUND
 
 
-def test_delete_key_requires_login(client):
+def test_revoke_key_requires_login(client):
+    resp = client.post("/profile/keys/1/revoke", follow_redirects=False)
+    assert resp.status_code == HTTPStatus.FOUND
+
+
+def test_old_delete_key_url_returns_405(app, auth_client, test_user):
+    kid = _make_personal_key(app, test_user["id"], "sk_" + "q" * 32)
+    resp = auth_client.delete(f"/profile/keys/{kid}")
+    assert resp.status_code == HTTPStatus.METHOD_NOT_ALLOWED
+    assert _personal_key_state(app, kid)[0] is None
+
+
+def test_old_delete_key_url_requires_login(client):
     resp = client.delete("/profile/keys/1", follow_redirects=False)
     assert resp.status_code == HTTPStatus.FOUND
 
@@ -232,7 +329,7 @@ def test_delete_key_requires_login(client):
 # rotate_key
 # ---------------------------------------------------------------------------
 
-def _seed_key_with_usage(app, entity_id, raw, active=True):
+def _seed_key_with_usage(app, entity_id, raw, revoked_at=None):
     """Insert a key with non-zero usage counters; return its id."""
     from lumen.extensions import db
     from lumen.models.api_key import APIKey
@@ -240,7 +337,7 @@ def _seed_key_with_usage(app, entity_id, raw, active=True):
     with app.app_context():
         ak = APIKey(
             entity_id=entity_id, created_by_entity_id=entity_id, name="rotating",
-            key_hash=hash_api_key(raw), key_hint=f"{raw[:7]}...{raw[-4:]}", active=active,
+            key_hash=hash_api_key(raw), key_hint=f"{raw[:7]}...{raw[-4:]}", revoked_at=revoked_at,
             requests=5, input_tokens=100, output_tokens=40, audio_seconds=7,
             cost=Decimal("1.500000"), last_used_at=datetime(2026, 9, 1, 12, 0),
             created_at=datetime(2026, 8, 1, 9, 0),
@@ -257,7 +354,7 @@ def _key_snapshot(app, kid):
         ak = db.session.get(APIKey, kid)
         return {c: getattr(ak, c) for c in (
             "requests", "input_tokens", "output_tokens", "audio_seconds", "cost",
-            "last_used_at", "name", "created_at", "created_by_entity_id", "entity_id", "active",
+            "last_used_at", "name", "created_at", "created_by_entity_id", "entity_id", "revoked_at",
             "key_hash", "key_hint",
         )}
 
@@ -291,10 +388,11 @@ def test_rotate_key_forbidden_for_other_user(app, auth_client, admin_user):
     assert resp.status_code == HTTPStatus.FORBIDDEN
 
 
-def test_rotate_key_inactive_returns_409(app, auth_client, test_user):
-    kid = _seed_key_with_usage(app, test_user["id"], "sk_" + "i" * 32, active=False)
+def test_rotate_revoked_key_returns_409(app, auth_client, test_user):
+    kid = _seed_key_with_usage(app, test_user["id"], "sk_" + "i" * 32, revoked_at=datetime(2026, 9, 2, 8, 0))
     resp = auth_client.post(f"/profile/keys/{kid}/rotate", json={"key": "sk_" + "j" * 32})
     assert resp.status_code == HTTPStatus.CONFLICT
+    assert resp.get_json()["error"] == "Key is revoked"
 
 
 @pytest.mark.parametrize("payload", [
@@ -539,18 +637,10 @@ def test_profile_page_shows_needs_ack_model(app, auth_client, test_user):
 # ---------------------------------------------------------------------------
 
 def _make_managed_project(app, user_id, name="managed-svc"):
-    """Create an active project entity managed by user_id; return its id."""
+    """Create an active project entity owned (and so managed) by user_id; return its id."""
     with app.app_context():
-        from lumen.extensions import db
-        from lumen.models.entity import Entity
-        from lumen.models.entity_manager import EntityManager
-        proj = Entity(entity_type="project", name=name, initials="MS", active=True)
-        db.session.add(proj)
-        db.session.flush()
-        db.session.add(EntityManager(user_entity_id=user_id, project_entity_id=proj.id))
-        db.session.commit()
-        db.session.refresh(proj)
-        return proj.id
+        from tests.conftest import make_project
+        return make_project(name, owner_id=user_id, initials="MS").id
 
 
 def test_profile_projects_section_hidden_when_none(auth_client):
@@ -578,14 +668,8 @@ def test_profile_projects_section_shows_managed_project(app, auth_client, test_u
 def test_profile_projects_section_includes_inactive(app, auth_client, test_user):
     """An inactive managed project is still shown so the manager can reach and re-enable it."""
     with app.app_context():
-        from lumen.extensions import db
-        from lumen.models.entity import Entity
-        from lumen.models.entity_manager import EntityManager
-        proj = Entity(entity_type="project", name="inactive-client", initials="IC", active=False)
-        db.session.add(proj)
-        db.session.flush()
-        db.session.add(EntityManager(user_entity_id=test_user["id"], project_entity_id=proj.id))
-        db.session.commit()
+        from tests.conftest import make_project
+        make_project("inactive-client", owner_id=test_user["id"], initials="IC", active=False)
 
     resp = auth_client.get("/profile")
     assert resp.status_code == HTTPStatus.OK

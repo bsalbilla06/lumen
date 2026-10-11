@@ -1,4 +1,6 @@
 """Tests for field precedence in lumen/services/model_sync.sync_model."""
+import pytest
+
 from lumen.services import model_sync
 
 
@@ -162,7 +164,7 @@ def test_price_averaged_across_providers(monkeypatch):
         {"id": "github/gpt-4o", "cost": {"input": 0, "output": 12}},  # 0 input excluded
     ]
     _patch_price(monkeypatch, dev_models, dev_models[0])
-    result = model_sync.sync_model({"name": "gpt-4o", "endpoints": [{"url": "http://x"}]})
+    result = model_sync.sync_model({"name": "gpt-4o", "auto_price": True, "endpoints": [{"url": "http://x"}]})
     assert result["updates"]["input_cost_per_million"] == 3.0          # mean(2.5, 3.5)
     assert result["updates"]["output_cost_per_million"] == round(34 / 3, 6)  # mean(10, 12, 12)
 
@@ -174,7 +176,7 @@ def test_price_zero_listing_excluded(monkeypatch):
         {"id": "q/llama-3.3-70b", "cost": {"input": 1.2, "output": 1.8}},
     ]
     _patch_price(monkeypatch, dev_models, dev_models[1])
-    result = model_sync.sync_model({"name": "llama-3.3-70b", "endpoints": [{"url": "http://x"}]})
+    result = model_sync.sync_model({"name": "llama-3.3-70b", "auto_price": True, "endpoints": [{"url": "http://x"}]})
     assert result["updates"]["input_cost_per_million"] == 1.2
     assert result["updates"]["output_cost_per_million"] == 1.8
 
@@ -183,23 +185,48 @@ def test_no_price_update_when_all_zero(monkeypatch):
     """If every provider lists $0, no cost update is proposed (never 0)."""
     dev_models = [{"id": "p/m", "cost": {"input": 0, "output": 0}}]
     _patch_price(monkeypatch, dev_models, dev_models[0])
-    result = model_sync.sync_model({"name": "m", "endpoints": [{"url": "http://x"}]})
+    result = model_sync.sync_model({"name": "m", "auto_price": True, "endpoints": [{"url": "http://x"}]})
     assert "input_cost_per_million" not in result["updates"]
     assert "output_cost_per_million" not in result["updates"]
 
 
 def test_price_overwrites_stale_operator_value(monkeypatch):
-    """A trusted match corrects a stale/zero operator-set price."""
+    """With auto_price, a trusted match corrects a stale/zero operator-set price."""
     dev_models = [{"id": "p/m", "cost": {"input": 5.0, "output": 15.0}}]
     _patch_price(monkeypatch, dev_models, dev_models[0])
     result = model_sync.sync_model({
         "name": "m",
+        "auto_price": True,
         "input_cost_per_million": 0,
         "output_cost_per_million": 0,
         "endpoints": [{"url": "http://x"}],
     })
     assert result["updates"]["input_cost_per_million"] == 5.0
     assert result["updates"]["output_cost_per_million"] == 15.0
+
+
+@pytest.mark.parametrize("flag", [{}, {"auto_price": False}])
+def test_manual_price_kept_but_other_fields_update(monkeypatch, flag):
+    """Without auto_price: true, prices are left alone; other fields still sync."""
+    dev_models = [{
+        "id": "p/m",
+        "cost": {"input": 5.0, "output": 15.0},
+        "limit": {"context": 200000, "output": 64000},
+        "reasoning": True,
+    }]
+    _patch_price(monkeypatch, dev_models, dev_models[0])
+    result = model_sync.sync_model({
+        "name": "m",
+        "input_cost_per_million": 1.0,
+        "output_cost_per_million": 2.0,
+        "endpoints": [{"url": "http://x"}],
+        **flag,
+    })
+    assert "input_cost_per_million" not in result["updates"]
+    assert "output_cost_per_million" not in result["updates"]
+    assert result["updates"]["context_window"] == 200000
+    assert result["updates"]["max_output_tokens"] == 64000
+    assert result["updates"]["supports_reasoning"] is True
 
 
 def test_price_untouched_without_dev_match(monkeypatch):
@@ -215,7 +242,68 @@ def test_price_untouched_without_dev_match(monkeypatch):
     assert "output_cost_per_million" not in result["updates"]
 
 
-# ── fetch_endpoint_model: SGLang /get_server_info first ────────────────────────
+# ── supports_reasoning: models.dev provider consensus ──────────────────────────
+
+def _reasoning_models(*flags):
+    # Distinct provider ids that all normalize to "m", so they share one price-index group.
+    return [{"id": f"p{i}/m", "reasoning": f} for i, f in enumerate(flags)]
+
+
+def test_reasoning_majority_wins_over_first_match(monkeypatch):
+    dev_models = _reasoning_models(False, True, True)
+    _patch_price(monkeypatch, dev_models, dev_models[0])
+    result = model_sync.sync_model({"name": "m", "supports_reasoning": False, "endpoints": [{"url": "http://x"}]})
+    assert result["updates"]["supports_reasoning"] is True
+
+
+def test_reasoning_tie_leaves_field_untouched(monkeypatch):
+    dev_models = _reasoning_models(True, False)
+    _patch_price(monkeypatch, dev_models, dev_models[0])
+    result = model_sync.sync_model({"name": "m", "supports_reasoning": False, "endpoints": [{"url": "http://x"}]})
+    assert "supports_reasoning" not in result["updates"]
+
+
+def test_reasoning_ignores_providers_without_boolean(monkeypatch):
+    dev_models = _reasoning_models(None, "yes", True)
+    _patch_price(monkeypatch, dev_models, dev_models[0])
+    result = model_sync.sync_model({"name": "m", "endpoints": [{"url": "http://x"}]})
+    assert result["updates"]["supports_reasoning"] is True
+
+
+def test_reasoning_no_data_leaves_field_untouched(monkeypatch):
+    dev_models = _reasoning_models(None, None)
+    _patch_price(monkeypatch, dev_models, dev_models[0])
+    result = model_sync.sync_model({"name": "m", "supports_reasoning": True, "endpoints": [{"url": "http://x"}]})
+    assert "supports_reasoning" not in result["updates"]
+
+
+def test_reasoning_missing_key_treated_as_false(monkeypatch):
+    dev_models = _reasoning_models(False, False, True)
+    _patch_price(monkeypatch, dev_models, dev_models[0])
+    result = model_sync.sync_model({"name": "m", "endpoints": [{"url": "http://x"}]})
+    assert "supports_reasoning" not in result["updates"]
+
+
+def test_reasoning_true_already_matches_consensus(monkeypatch):
+    dev_models = _reasoning_models(True, True, False)
+    _patch_price(monkeypatch, dev_models, dev_models[2])
+    result = model_sync.sync_model({"name": "m", "supports_reasoning": True, "endpoints": [{"url": "http://x"}]})
+    assert "supports_reasoning" not in result["updates"]
+
+
+def test_reasoning_downgraded_when_consensus_false(monkeypatch):
+    dev_models = _reasoning_models(True, False, False)
+    _patch_price(monkeypatch, dev_models, dev_models[0])
+    result = model_sync.sync_model({"name": "m", "supports_reasoning": True, "endpoints": [{"url": "http://x"}]})
+    assert result["updates"]["supports_reasoning"] is False
+
+
+def test_consensus_without_dev_id_is_none():
+    index = model_sync._build_price_index(_reasoning_models(True, True))
+    assert model_sync._consensus_bool({"reasoning": True}, index, "reasoning") is None
+
+
+# ── fetch_endpoint_model: server info first ────────────────────────────────────
 
 class _Resp:
     def __init__(self, payload, ok=True):
@@ -234,7 +322,7 @@ def _patch_probe(monkeypatch, fake_get):
 
 
 def test_sglang_server_info_preferred_over_v1_models(monkeypatch):
-    """/get_server_info is called first; when it 200s, /v1/models is never hit.
+    """The server info is read first; when it 200s, /v1/models is never hit.
     SGLang's max_req_input_len wins over /v1/models' theoretical max_model_len."""
     calls = []
     def fake_get(url, **kw):
@@ -355,6 +443,144 @@ def test_get_model_info_fallback(monkeypatch):
     assert r["max_model_len"] == 8192
 
 
+# ── reasoning from the backend's /server_info ─────────────────────────────────
+
+def _sync_with_probe(monkeypatch, fake_get, dev_flags, current=None):
+    """Run sync_model with a stubbed probe and models.dev providers reporting dev_flags."""
+    _patch_probe(monkeypatch, fake_get)
+    dev_models = _reasoning_models(*dev_flags)
+    monkeypatch.setattr(model_sync, "get_modelsdev", lambda: (dev_models, model_sync._build_price_index(dev_models)))
+    monkeypatch.setattr(model_sync, "find_in_modelsdev", lambda *a, **k: dev_models[0])
+    model_def = {"name": "m", "endpoints": [{"url": "http://x/v1"}]}
+    if current is not None:
+        model_def["supports_reasoning"] = current
+    return model_sync.sync_model(model_def)
+
+
+def _sglang_server_info(reasoning_parser):
+    def fake_get(url):
+        if url == "http://x/server_info?config_format=json":
+            return _Resp({"max_req_input_len": 32768, "served_model_name": "m", "is_embedding": False,
+                          "enable_multimodal": None, "reasoning_parser": reasoning_parser})
+        return _Resp({}, ok=False)
+    return fake_get
+
+
+def _vllm_server_info(server_info):
+    def fake_get(url):
+        if url == "http://x/server_info?config_format=json":
+            return server_info
+        if url == "http://x/v1/models":
+            return _Resp({"data": [{"id": "m", "max_model_len": 32768}]})
+        return _Resp({}, ok=False)
+    return fake_get
+
+
+def _vllm_config(reasoning_parser):
+    return {"vllm_config": {"structured_outputs_config": {"reasoning_parser": reasoning_parser}}}
+
+
+def test_sglang_reasoning_parser_set_overrides_dev_false(monkeypatch):
+    result = _sync_with_probe(monkeypatch, _sglang_server_info("qwen3"), [False, False])
+    assert result["updates"]["supports_reasoning"] is True
+
+
+def test_sglang_reasoning_parser_null_overrides_dev_true(monkeypatch):
+    result = _sync_with_probe(monkeypatch, _sglang_server_info(None), [True, True], current=True)
+    assert result["updates"]["supports_reasoning"] is False
+
+
+def test_sglang_reasoning_parser_null_with_missing_key_is_no_change(monkeypatch):
+    """Backend false + unset field: no update, even when models.dev says true."""
+    result = _sync_with_probe(monkeypatch, _sglang_server_info(None), [True, True])
+    assert "supports_reasoning" not in result["updates"]
+
+
+def test_old_sglang_get_server_info_falls_back_to_dev_consensus(monkeypatch):
+    """/server_info 404 → /get_server_info without reasoning_parser: models.dev
+    decides reasoning; the context and modality flags still come through."""
+    calls = []
+    def fake_get(url):
+        calls.append(url)
+        if url == "http://x/get_server_info":
+            return _Resp({"max_req_input_len": 500410, "served_model_name": "m",
+                          "is_embedding": False, "enable_multimodal": False})
+        return _Resp({}, ok=False)
+    _patch_probe(monkeypatch, fake_get)
+    r = model_sync.fetch_endpoint_model({"url": "http://x/v1", "api_key": "k"})
+    assert calls[:2] == ["http://x/server_info?config_format=json", "http://x/get_server_info"]
+    assert r["backend"] == "sglang"
+    assert r["max_model_len"] == 500410
+    assert "reasoning" not in r
+
+    result = _sync_with_probe(monkeypatch, fake_get, [False, True, True])
+    assert result["updates"]["supports_reasoning"] is True
+    assert result["updates"]["context_window"] == 500410
+    assert result["updates"]["input_modalities"] == ["text"]
+
+
+def test_vllm_dev_mode_reasoning_parser_set(monkeypatch):
+    fake_get = _vllm_server_info(_Resp(_vllm_config("qwen3")))
+    _patch_probe(monkeypatch, fake_get)
+    r = model_sync.fetch_endpoint_model({"url": "http://x/v1", "api_key": "k"})
+    assert r == {"id": "m", "max_model_len": 32768, "backend": "vllm", "reasoning": True}
+
+    result = _sync_with_probe(monkeypatch, fake_get, [False, False])
+    assert result["updates"]["supports_reasoning"] is True
+
+
+def test_vllm_dev_mode_reasoning_parser_empty(monkeypatch):
+    result = _sync_with_probe(monkeypatch, _vllm_server_info(_Resp(_vllm_config(""))), [True, True], current=True)
+    assert result["updates"]["supports_reasoning"] is False
+
+
+def test_vllm_config_without_reasoning_parser_falls_back_to_dev(monkeypatch):
+    fake_get = _vllm_server_info(_Resp({"vllm_config": {"model_config": {}}}))
+    _patch_probe(monkeypatch, fake_get)
+    r = model_sync.fetch_endpoint_model({"url": "http://x/v1", "api_key": "k"})
+    assert r["backend"] == "vllm"
+    assert "reasoning" not in r
+
+
+def test_vllm_server_info_404_falls_back_to_dev(monkeypatch):
+    fake_get = _vllm_server_info(_Resp({}, ok=False))
+    _patch_probe(monkeypatch, fake_get)
+    r = model_sync.fetch_endpoint_model({"url": "http://x/v1", "api_key": "k"})
+    assert "backend" not in r
+    assert "reasoning" not in r
+
+    result = _sync_with_probe(monkeypatch, fake_get, [False, True, True])
+    assert result["updates"]["supports_reasoning"] is True
+
+
+def test_vllm_text_format_falls_back_to_dev(monkeypatch):
+    """The default text format returns vllm_config as one string: unreadable, so models.dev decides."""
+    fake_get = _vllm_server_info(_Resp({"vllm_config": "model='m', reasoning_parser='qwen3', ..."}))
+    _patch_probe(monkeypatch, fake_get)
+    r = model_sync.fetch_endpoint_model({"url": "http://x/v1", "api_key": "k"})
+    assert "backend" not in r
+    assert "reasoning" not in r
+
+    result = _sync_with_probe(monkeypatch, fake_get, [True, False, False], current=True)
+    assert result["updates"]["supports_reasoning"] is False
+
+
+def test_server_info_non_json_falls_back_to_get_server_info(monkeypatch):
+    class _BadJson(_Resp):
+        def json(self):
+            raise ValueError("not json")
+    def fake_get(url):
+        if url.endswith("/server_info?config_format=json"):
+            return _BadJson({})
+        if url.endswith("/get_server_info"):
+            return _Resp({"max_req_input_len": 8192, "reasoning_parser": "deepseek-r1"})
+        return _Resp({}, ok=False)
+    _patch_probe(monkeypatch, fake_get)
+    r = model_sync.fetch_endpoint_model({"url": "http://x", "api_key": "k"})
+    assert r["max_model_len"] == 8192
+    assert r["reasoning"] is True
+
+
 # ── server-authoritative modalities ───────────────────────────────────────────
 
 def _patch_ep(monkeypatch, ep_model, dev_match):
@@ -373,14 +599,98 @@ def test_server_embedding_sets_text_in_empty_out(monkeypatch):
     assert result["updates"]["output_modalities"] == []
 
 
-def test_server_multimodal_disabled_strips_image(monkeypatch):
-    """enable_multimodal=null on the server vetoes models.dev's image claim."""
+def test_server_multimodal_null_keeps_dev_image(monkeypatch):
+    """enable_multimodal=null (SGLang auto-detect) keeps models.dev's image claim."""
+    _patch_ep(monkeypatch,
+              ep_model={"id": "m", "max_model_len": 32768, "backend": "sglang", "is_embedding": False, "enable_multimodal": None},
+              dev_match={"modalities": {"input": ["text", "image"], "output": ["text"]}})
+    result = model_sync.sync_model({"name": "m", "input_modalities": ["text"],
+                                    "endpoints": [{"url": "http://x"}]})
+    assert result["updates"]["input_modalities"] == ["text", "image"]
+
+
+def test_server_multimodal_null_keeps_operator_image(monkeypatch):
+    """enable_multimodal=null + operator already has image → no change proposed."""
     _patch_ep(monkeypatch,
               ep_model={"id": "m", "max_model_len": 32768, "backend": "sglang", "is_embedding": False, "enable_multimodal": None},
               dev_match={"modalities": {"input": ["text", "image"], "output": ["text"]}})
     result = model_sync.sync_model({"name": "m", "input_modalities": ["text", "image"],
+                                    "output_modalities": ["text"],
+                                    "endpoints": [{"url": "http://x"}]})
+    assert "input_modalities" not in result["updates"]
+    assert "output_modalities" not in result["updates"]
+
+
+def test_server_multimodal_null_no_dev_match_keeps_operator(monkeypatch):
+    """enable_multimodal=null + no models.dev match → operator modalities untouched."""
+    _patch_ep(monkeypatch,
+              ep_model={"id": "m", "max_model_len": 32768, "backend": "sglang", "is_embedding": False, "enable_multimodal": None},
+              dev_match=None)
+    result = model_sync.sync_model({"name": "m", "input_modalities": ["text", "audio"],
+                                    "endpoints": [{"url": "http://x"}]})
+    assert "input_modalities" not in result["updates"]
+    assert "output_modalities" not in result["updates"]
+
+
+def test_server_multimodal_missing_keeps_operator(monkeypatch):
+    """enable_multimodal absent from /get_server_info behaves like null."""
+    _patch_ep(monkeypatch,
+              ep_model={"id": "m", "max_model_len": 32768, "backend": "sglang", "is_embedding": False},
+              dev_match=None)
+    result = model_sync.sync_model({"name": "m", "input_modalities": ["text", "image"],
+                                    "endpoints": [{"url": "http://x"}]})
+    assert "input_modalities" not in result["updates"]
+    assert "output_modalities" not in result["updates"]
+
+
+def test_server_multimodal_false_strips_image(monkeypatch):
+    """enable_multimodal=False on the server vetoes models.dev's image claim."""
+    _patch_ep(monkeypatch,
+              ep_model={"id": "m", "max_model_len": 32768, "backend": "sglang", "is_embedding": False, "enable_multimodal": False},
+              dev_match={"modalities": {"input": ["text", "image"], "output": ["text"]}})
+    result = model_sync.sync_model({"name": "m", "input_modalities": ["text", "image"],
                                     "endpoints": [{"url": "http://x"}]})
     assert result["updates"]["input_modalities"] == ["text"]
+
+
+def test_server_multimodal_false_keeps_audio(monkeypatch):
+    """enable_multimodal=False strips image/video but keeps audio."""
+    _patch_ep(monkeypatch,
+              ep_model={"id": "m", "max_model_len": 32768, "backend": "sglang", "is_embedding": False, "enable_multimodal": False},
+              dev_match={"modalities": {"input": ["text", "image", "audio", "video"], "output": ["text"]}})
+    result = model_sync.sync_model({"name": "m", "input_modalities": ["text"],
+                                    "endpoints": [{"url": "http://x"}]})
+    assert result["updates"]["input_modalities"] == ["text", "audio"]
+
+
+def test_server_multimodal_false_keeps_operator_audio(monkeypatch):
+    """enable_multimodal=False + no models.dev match → operator's audio kept, no change."""
+    _patch_ep(monkeypatch,
+              ep_model={"id": "m", "max_model_len": 32768, "backend": "sglang", "is_embedding": False, "enable_multimodal": False},
+              dev_match=None)
+    result = model_sync.sync_model({"name": "m", "input_modalities": ["text", "audio"],
+                                    "endpoints": [{"url": "http://x"}]})
+    assert "input_modalities" not in result["updates"]
+
+
+def test_server_multimodal_enabled_audio_only_unchanged(monkeypatch):
+    """enable_multimodal=True + audio-only model → image is not added."""
+    _patch_ep(monkeypatch,
+              ep_model={"id": "m", "max_model_len": 32768, "backend": "sglang", "is_embedding": False, "enable_multimodal": True},
+              dev_match={"modalities": {"input": ["text", "audio"], "output": ["text"]}})
+    result = model_sync.sync_model({"name": "m", "input_modalities": ["text", "audio"],
+                                    "endpoints": [{"url": "http://x"}]})
+    assert "input_modalities" not in result["updates"]
+
+
+def test_server_multimodal_enabled_operator_audio_only_unchanged(monkeypatch):
+    """enable_multimodal=True + no models.dev match + operator ['text','audio'] → no image added."""
+    _patch_ep(monkeypatch,
+              ep_model={"id": "m", "max_model_len": 32768, "backend": "sglang", "is_embedding": False, "enable_multimodal": True},
+              dev_match=None)
+    result = model_sync.sync_model({"name": "m", "input_modalities": ["text", "audio"],
+                                    "endpoints": [{"url": "http://x"}]})
+    assert "input_modalities" not in result["updates"]
 
 
 def test_server_multimodal_enabled_adds_image(monkeypatch):

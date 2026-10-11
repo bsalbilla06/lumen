@@ -20,6 +20,8 @@ Env vars: BASE_URL (default http://localhost:5001), OUTPUT_DIR (default docs/img
 MODEL (default: first active model), CHROME_PATH (fallback browser executable).
 """
 import os
+from datetime import timedelta
+from decimal import Decimal
 
 from playwright.sync_api import sync_playwright
 from sqlalchemy import select
@@ -31,10 +33,12 @@ from lumen.models.entity import Entity
 from lumen.models.entity_manager import EntityManager
 from lumen.models.model_config import ModelConfig
 from lumen.services.crypto import hash_api_key
+from lumen.timeutils import utcnow
 
 BASE = os.environ.get("BASE_URL", "http://localhost:5001").rstrip("/")
 OUT = os.environ.get("OUTPUT_DIR", "docs/img")
 DEMO_USER = "screenshot-demo@example.com"
+DEMO_MANAGER = "screenshot-manager@example.com"
 
 HIDE_CSS = """
 ilw-footer, footer, [slot='footer'] { display:none !important; }
@@ -61,19 +65,6 @@ def ensure_demo_data(app):
             db.session.add(user)
         # Models without an owner are visible to everyone, so no access setup is needed.
 
-        project = db.session.execute(
-            select(Entity).filter_by(name="example-bot", entity_type="project")
-        ).scalar_one_or_none()
-        if not project:
-            project = Entity(entity_type="project", name="example-bot", initials="EB", active=True)
-            db.session.add(project)
-            db.session.flush()
-            key = "sk_example_0123456789abcdef"
-            db.session.add(APIKey(entity_id=project.id, name="example-key",
-                                  created_by_entity_id=user.id,
-                                  key_hash=hash_api_key(key),
-                                  key_hint=f"{key[:7]}...{key[-4:]}", active=True))
-
         # The dev user must manage the demo project or /projects renders no
         # link to it (admins browse as normal users by default).
         dev_email = app.config.get("DEV_USER")
@@ -84,27 +75,76 @@ def ensure_demo_data(app):
             dev = Entity(entity_type="user", email=dev_email, name="Dev User",
                          initials="DU", active=True)
             db.session.add(dev)
+        db.session.flush()
+
+        project = db.session.execute(
+            select(Entity).filter_by(name="example-bot", entity_type="project")
+        ).scalar_one_or_none()
+        if not project:
+            # A project needs its owner, and the owner's manager row, from the start.
+            owner = dev or user
+            project = Entity(entity_type="project", name="example-bot", initials="EB", active=True,
+                             owner_entity_id=owner.id)
+            db.session.add(project)
             db.session.flush()
+            db.session.add(EntityManager(user_entity_id=owner.id, project_entity_id=project.id))
+            key = "sk_example_0123456789abcdef"
+            db.session.add(APIKey(entity_id=project.id, name="example-key",
+                                  created_by_entity_id=user.id,
+                                  key_hash=hash_api_key(key),
+                                  key_hint=f"{key[:7]}...{key[-4:]}"))
+            db.session.flush()
+
+        # An active and a revoked personal key, so the profile shot shows Revoke and the badge.
+        if dev:
+            now = utcnow()
+            for name, raw, revoked_at, requests, tokens_in, tokens_out, cost, last_used in (
+                ("my-script", "sk_myscript_0123456789abcd", None, 42, 9800, 3100, "0.84",
+                 now - timedelta(hours=2)),
+                ("old-notebook", "sk_oldnotebook_0123456789ab", now - timedelta(days=3), 17, 4200, 1300, "0.31",
+                 now - timedelta(days=4)),
+            ):
+                if not db.session.execute(select(APIKey).filter_by(entity_id=dev.id, name=name)).scalar_one_or_none():
+                    db.session.add(APIKey(entity_id=dev.id, created_by_entity_id=dev.id, name=name,
+                                          key_hash=hash_api_key(raw), key_hint=f"{raw[:7]}...{raw[-4:]}",
+                                          revoked_at=revoked_at, requests=requests, input_tokens=tokens_in,
+                                          output_tokens=tokens_out, cost=Decimal(cost), last_used_at=last_used))
+
         if dev and not db.session.execute(
             select(EntityManager).filter_by(user_entity_id=dev.id, project_entity_id=project.id)
         ).scalar_one_or_none():
-            db.session.add(EntityManager(user_entity_id=dev.id, project_entity_id=project.id, is_owner=True))
+            db.session.add(EntityManager(user_entity_id=dev.id, project_entity_id=project.id))
 
-        # Give one model an owner and a group grant so the admin Access card
-        # (model-access.png) shows a populated example instead of "Everyone".
-        from lumen.models.group import Group
-        from lumen.models.model_group_access import ModelGroupAccess
+        # A manager and a plain user, so the Members tab shows every role and its actions.
+        manager = db.session.execute(
+            select(Entity).filter_by(email=DEMO_MANAGER, entity_type="user")
+        ).scalar_one_or_none()
+        if not manager:
+            manager = Entity(entity_type="user", email=DEMO_MANAGER, name="Demo Manager",
+                             initials="DM", active=True)
+            db.session.add(manager)
+            db.session.flush()
+        # Existing rows are reset to the seed role so re-runs stay reproducible.
+        for member, role in ((manager, "manager"), (user, "user")):
+            if member.id == project.owner_entity_id:
+                continue
+            row = db.session.execute(
+                select(EntityManager).filter_by(user_entity_id=member.id, project_entity_id=project.id)
+            ).scalar_one_or_none()
+            if row:
+                row.role = role
+            else:
+                db.session.add(EntityManager(user_entity_id=member.id, project_entity_id=project.id,
+                                             role=role))
+
+        # Give one model an owner so the admin Access card (model-access.png)
+        # shows a populated example instead of "Everyone".
         owned = db.session.execute(
             select(ModelConfig).where(ModelConfig.active).order_by(ModelConfig.model_name)
         ).scalars().all()
         owned = owned[1] if len(owned) > 1 else None
         if dev and owned:
             owned.owner_entity_id = dev.id
-            grp = db.session.execute(select(Group).filter_by(name="staff")).scalar_one_or_none()
-            if grp and not db.session.execute(
-                select(ModelGroupAccess).filter_by(model_config_id=owned.id, group_id=grp.id)
-            ).scalar_one_or_none():
-                db.session.add(ModelGroupAccess(model_config_id=owned.id, group_id=grp.id))
         db.session.commit()
         owned_name = owned.model_name if owned else None
 
@@ -154,8 +194,11 @@ def main():
         page.screenshot(path=f"{OUT}/chat.png")
         print("chat.png")
 
-        def shot(path, name, full=False):
+        def shot(path, name, full=False, check=None):
             page.goto(BASE + path, wait_until="networkidle")
+            if check:
+                page.check(check)
+                page.evaluate("document.activeElement.blur()")
             page.wait_for_timeout(1200)
             hide_chrome(page)
             page.screenshot(path=f"{OUT}/{name}.png", full_page=full)
@@ -167,7 +210,7 @@ def main():
         page.goto(BASE + "/projects", wait_until="networkidle")
         href = page.eval_on_selector("a[href*='/projects/']", "e => e.getAttribute('href')")
         shot(href, "project-detail", full=True)
-        shot("/profile", "profile", full=True)
+        shot("/profile", "profile", full=True, check="#show-revoked-cb")
 
         # Admin-only Access card on an owned model's detail page (cropped to the
         # card). The card renders only in admin mode, so flip the toggle first.

@@ -54,7 +54,7 @@ def _make_manual_key(app, entity_id, name):
     with app.app_context():
         db.session.add(APIKey(
             entity_id=entity_id, name=name, key_hash=hash_api_key(raw),
-            key_hint=f"{raw[:7]}...{raw[-4:]}", active=True,
+            key_hint=f"{raw[:7]}...{raw[-4:]}",
         ))
         db.session.commit()
     return raw
@@ -120,6 +120,33 @@ def test_existing_key_requires_overwrite(client, auth_client, app, test_user):
     assert new_key != old_key
     assert client.get("/v1/models", headers={"Authorization": f"Bearer {new_key}"}).status_code == HTTPStatus.OK
     assert client.get("/v1/models", headers={"Authorization": f"Bearer {old_key}"}).status_code == HTTPStatus.UNAUTHORIZED
+
+
+def test_overwrite_revokes_old_key(client, auth_client, app, test_user):
+    _make_manual_key(app, test_user["id"], "opencode")
+    with app.app_context():
+        old = db.session.execute(select(APIKey)).scalar_one()
+        old.requests, old.input_tokens, old.output_tokens, old.cost = 7, 100, 50, 1.25
+        db.session.commit()
+        old_id = old.id
+
+    body = _issue(client, name="opencode")
+    auth_client.get(f"/device?code={body['user_code']}")
+    req_id = _request_row(app, body["user_code"]).id
+    assert auth_client.post("/oauth/consent", data={
+        "request_id": req_id, "action": "approve", "overwrite": "on",
+    }).status_code == HTTPStatus.OK
+    new_key = _poll(client, body).get_json()["access_token"]
+    assert client.get("/v1/models", headers={"Authorization": f"Bearer {new_key}"}).status_code == HTTPStatus.OK
+
+    with app.app_context():
+        old = db.session.get(APIKey, old_id)
+        # The old row and its usage counters survive; only revoked_at is set.
+        assert old is not None and abs(utcnow() - old.revoked_at) < timedelta(minutes=1)
+        assert old.revoked_by_entity_id == test_user["id"]
+        assert (old.requests, old.input_tokens, old.output_tokens, float(old.cost)) == (7, 100, 50, 1.25)
+        keys = db.session.execute(select(APIKey).where(APIKey.name == "opencode")).scalars().all()
+        assert sorted(k.revoked_at is None for k in keys) == [False, True]
 
 
 def test_name_conflict_between_approval_and_mint(client, auth_client, app, test_user):

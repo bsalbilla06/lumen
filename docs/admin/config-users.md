@@ -2,7 +2,7 @@
 
 > 🔒 **Admin only.** This page documents administrator features. Configuration lives in `config.yaml` and the in-app Config editor (`/admin/config`), which are only available to administrators.
 
-Lumen uses a group-based system to assign coin budgets and grant access to owned models. `config.yaml` carries a single user-management section: `admins:`. Everything about groups — coin pools, memberships (users and projects), model grants, and login auto-join rules — lives in the database and is managed on the [Groups pages](../groups/groups.md).
+Lumen uses a group-based system to assign coin budgets. `config.yaml` carries a single user-management section: `admins:`. Everything about groups — coin pools, memberships (users and projects), and login auto-join rules — lives in the database and is managed on the [Groups pages](../groups/groups.md).
 
 ## Admins
 
@@ -64,6 +64,6 @@ The Edit User dialog's **Groups** field shows the user's groups as pills. Type p
 
 ## Groups and Model Access
 
-Model access follows ownership: a model with no owner is available to everyone; an owned model is available only to its owner and to members of groups the model has been granted to. Grants are managed by admins on the model detail page (see [Configuring Models](config-models.md#access-control)) — never in `config.yaml`.
+Model access follows ownership: a model with no owner is available to everyone; an owned model is available only to its owner. Ownership is managed by admins on the model detail page (see [Configuring Models](config-models.md#access-control)) — never in `config.yaml`.
 
 Acknowledgement is also not a group setting — it lives on the model via `needs_ack`; if an accessible model has `needs_ack: true`, members still acknowledge it once before use.

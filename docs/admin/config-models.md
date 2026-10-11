@@ -25,7 +25,7 @@ models:
 
 ## Access Control
 
-Who may use a model is **not** configured in `config.yaml`. A model may have an **owner** (a user): a model with no owner is available to everyone (users and projects), while an owned model is available only to its owner and to members of groups the model has been explicitly granted to. Other users and projects cannot list the model or retrieve its detail-page or README metadata. Models awaiting acknowledgment remain visible because acknowledgment is a consent requirement, not an access grant. Ownership and group grants live in the database and are edited by admins via the **Access** card on the model detail page (`/models/<name>`) — see [Model Detail](../models/model-detail.md#access-admin-only). Config sync never touches them; the per-model `access:` key was removed in config version 3. If it remains in a config, Lumen ignores it and it does not restrict access; assign an owner and group grants in the UI instead.
+Who may use a model is **not** configured in `config.yaml`. A model may have an **owner** (a user): a model with no owner is available to everyone (users and projects), while an owned model is available only to its owner. Other users and projects cannot list the model or retrieve its detail-page or README metadata. Models awaiting acknowledgment remain visible because acknowledgment is a consent requirement, not an access grant. Ownership lives in the database and is edited by admins via the **Access** card on the model detail page (`/models/<name>`) — see [Model Detail](../models/model-detail.md#access-admin-only). Config sync never touches it; the per-model `access:` key was removed in config version 3. If it remains in a config, Lumen ignores it and it does not restrict access; assign an owner in the UI instead.
 
 > **Upgrading:** after upgrading from a version that used the config-based allow/block system, all non-disabled models are **public** until an admin assigns owners.
 
@@ -60,7 +60,7 @@ models:
 
 ### `disabled` is a hard off
 
-Setting `disabled: true` blocks the model for everyone — it disappears from the chat UI and the API, regardless of ownership or group grants. This replaces the old `active: false`. To **permanently** remove a model, delete its entry from `config.yaml` entirely.
+Setting `disabled: true` blocks the model for everyone — it disappears from the chat UI and the API, regardless of ownership. This replaces the old `active: false`. To **permanently** remove a model, delete its entry from `config.yaml` entirely.
 
 > The legacy `active:` key is still accepted as input (with a deprecation warning): `active: false` maps to `disabled: true`. Prefer `disabled` in new configs.
 
@@ -106,6 +106,9 @@ Fields shown to users on the Models page:
 |-------|-------------|---------|
 | `input_cost_per_million` | Coins charged per 1M input tokens | 0.0 |
 | `output_cost_per_million` | Coins charged per 1M output tokens | 0.0 |
+| `auto_price` | Take input/output prices from models.dev on Update (admin only, not shown to users) | `false` |
+
+Prices are set by hand unless `auto_price: true` is set; a missing key means manual. Update (in the config editor or `sync_models.py`) only changes the prices of models with `auto_price: true`, and keeps the current price if models.dev has none. In the config editor, tick **Automatic price (from models.dev)** in Pricing & Limits; the input and output price fields are then read-only.
 
 See the [Introduction](../introduction.md#tokens-and-coins) for how coin costs are calculated.
 
@@ -125,6 +128,8 @@ These fields tell the UI what the model can do and help users pick the right one
 | `input_modalities` | What the model accepts: `["text"]`, `["text", "image"]`, `["text", "image", "video"]`, `["text", "image", "video", "audio"]` |
 | `output_modalities` | What the model produces: typically `["text"]` |
 | `notice` | Optional admin note shown to users on the model detail page |
+
+On Update, `supports_reasoning` comes from the serving backend's reasoning parser when its `/server_info` is reachable (SGLang always; vLLM only in dev mode), and otherwise from the models.dev provider consensus.
 
 All fields except `name`, `input_cost_per_million`, and `output_cost_per_million` are optional. Everything else fills in the UI and API responses.
 

@@ -4,6 +4,8 @@ from http import HTTPStatus
 import pytest
 from sqlalchemy import func, select
 
+from lumen.timeutils import utcnow
+
 
 @pytest.fixture
 def api_key(app, test_user):
@@ -17,7 +19,6 @@ def api_key(app, test_user):
             entity_id=test_user["id"],
             name="test-key",
             key_hash=hash_api_key(token),
-            active=True,
         )
         db.session.add(ak)
         db.session.commit()
@@ -35,7 +36,7 @@ def inactive_api_key(app, test_user):
             entity_id=test_user["id"],
             name="inactive-key",
             key_hash=hash_api_key(token),
-            active=False,
+            revoked_at=utcnow(),
         )
         db.session.add(ak)
         db.session.commit()
@@ -88,6 +89,8 @@ def test_inactive_api_key_401(client, test_model, inactive_api_key):
         headers={"Authorization": f"Bearer {inactive_api_key}"},
     )
     assert resp.status_code == HTTPStatus.UNAUTHORIZED
+    assert resp.get_json()["error"]["type"] == "authentication_error"
+    assert resp.get_json()["error"]["message"] == "Invalid or revoked API key"
 
 
 def test_inactive_entity_403(app, client, test_user, api_key):
@@ -390,32 +393,6 @@ def test_chat_completions_ack_with_consent_passes_access(
     assert resp.status_code != HTTPStatus.FORBIDDEN
 
 
-def test_chat_completions_group_grant_passes_access(
-    app, client, test_user, test_model, api_key,
-):
-    """A group grant on an owned model clears the access gate (fails later at endpoint, not at 403)."""
-    token, _ = api_key
-    with app.app_context():
-        from lumen.extensions import db
-        from lumen.models.entity import Entity
-        from tests.conftest import grant_model_to_group, make_group_with_member, set_model_owner
-        _grant_unlimited_pool(app, test_user["id"])
-        owner = Entity(entity_type="user", email="owner@example.com", name="Owner", active=True)
-        db.session.add(owner)
-        db.session.commit()
-        set_model_owner(test_model["id"], owner.id)
-        group_id = make_group_with_member(test_user["id"])
-        grant_model_to_group(test_model["id"], group_id)
-
-    resp = client.post(
-        "/v1/chat/completions",
-        headers={"Authorization": f"Bearer {token}"},
-        json={"model": test_model["model_name"],
-              "messages": [{"role": "user", "content": "hi"}]},
-    )
-    assert resp.status_code != HTTPStatus.FORBIDDEN
-
-
 def test_chat_completions_missing_messages_400(client, api_key):
     """model provided but messages omitted → 400."""
     token, _ = api_key
@@ -429,99 +406,250 @@ def test_chat_completions_missing_messages_400(client, api_key):
 
 
 # ---------------------------------------------------------------------------
-# api.consent flag — consent: false exempts API from the ack gate
+# Model acknowledgment is always enforced for API keys
 # ---------------------------------------------------------------------------
 
-def _set_api_consent(app, value: bool):
-    yaml = dict(app.config.get("YAML_DATA") or {})
-    yaml["api"] = {**yaml.get("api", {}), "consent": value}
-    app.config["YAML_DATA"] = yaml
-    app.config["API_REQUIRE_MODEL_CONSENT"] = value
+_REQUIREMENTS = {
+    "needs_ack": {"needs_ack": True, "early_access": False},
+    "early_access": {"needs_ack": False, "early_access": True},
+    "both": {"needs_ack": True, "early_access": True},
+}
 
 
-def test_consent_false_ack_chat_completions_passes_access(
-    app, client, test_user, test_model, api_key,
-):
-    """api.consent=false: needs_ack model clears the access gate (fails later at endpoint, not at 403)."""
-    token, _ = api_key
-    _set_api_consent(app, False)
-    try:
-        with app.app_context():
-            from lumen.extensions import db
-            from lumen.models.model_config import ModelConfig
-            _grant_unlimited_pool(app, test_user["id"])
-            db.session.get(ModelConfig, test_model["id"]).needs_ack = True
-            db.session.commit()
-
-        resp = client.post(
-            "/v1/chat/completions",
-            headers={"Authorization": f"Bearer {token}"},
-            json={"model": test_model["model_name"],
-                  "messages": [{"role": "user", "content": "hi"}]},
-        )
-        assert resp.status_code != HTTPStatus.FORBIDDEN
-    finally:
-        _set_api_consent(app, True)
+def _set_requirements(model_id, needs_ack=False, early_access=False):
+    from lumen.extensions import db
+    from lumen.models.model_config import ModelConfig
+    mc = db.session.get(ModelConfig, model_id)
+    mc.needs_ack = needs_ack
+    mc.early_access = early_access
+    db.session.commit()
 
 
-def test_consent_false_ack_list_models_includes_model(
-    app, client, test_user, test_model, test_model_endpoint, api_key,
-):
-    """api.consent=false: needs_ack model without consent appears in /v1/models."""
-    token, _ = api_key
-    _set_api_consent(app, False)
-    try:
-        with app.app_context():
-            from lumen.extensions import db
-            from lumen.models.model_config import ModelConfig
-            _grant_unlimited_pool(app, test_user["id"])
-            db.session.get(ModelConfig, test_model["id"]).needs_ack = True
-            db.session.commit()
-
-        resp = client.get("/v1/models", headers={"Authorization": f"Bearer {token}"})
-        assert resp.status_code == HTTPStatus.OK
-        ids = [m["id"] for m in resp.get_json()["data"]]
-        assert test_model["model_name"] in ids
-    finally:
-        _set_api_consent(app, True)
+def _record_consent(entity_id, model_id):
+    """Acknowledge every current requirement on the model, as the UI does."""
+    from lumen.extensions import db
+    from lumen.models.entity_model_consent import EntityModelConsent
+    from lumen.models.model_config import ModelConfig
+    from lumen.timeutils import utcnow
+    mc = db.session.get(ModelConfig, model_id)
+    now = utcnow()
+    db.session.add(EntityModelConsent(
+        entity_id=entity_id, model_config_id=model_id,
+        consented_at=now if mc.needs_ack else None,
+        early_access_at=now if mc.early_access else None,
+    ))
+    db.session.commit()
 
 
-def test_consent_false_ack_get_model_returns_model(
-    app, client, test_user, test_model, test_model_endpoint, api_key,
-):
-    """api.consent=false: GET /v1/models/<id> returns needs_ack model without consent."""
-    token, _ = api_key
-    _set_api_consent(app, False)
-    try:
-        with app.app_context():
-            from lumen.extensions import db
-            from lumen.models.model_config import ModelConfig
-            _grant_unlimited_pool(app, test_user["id"])
-            db.session.get(ModelConfig, test_model["id"]).needs_ack = True
-            db.session.commit()
-
-        resp = client.get(
-            f"/v1/models/{test_model['model_name']}",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        assert resp.status_code == HTTPStatus.OK
-        assert resp.get_json()["id"] == test_model["model_name"]
-    finally:
-        _set_api_consent(app, True)
+def _add_api_key(entity_id, token):
+    from lumen.extensions import db
+    from lumen.models.api_key import APIKey
+    from lumen.services.crypto import hash_api_key
+    db.session.add(APIKey(entity_id=entity_id, name="consent-key", key_hash=hash_api_key(token)))
+    db.session.commit()
 
 
-def test_consent_true_ack_chat_completions_403(
-    app, client, test_user, test_model, api_key,
-):
-    """api.consent=true (explicit): needs_ack model without consent still returns 403."""
-    token, _ = api_key
-    _set_api_consent(app, True)
+@pytest.fixture(params=["user", "project"])
+def key_entity(request, app, test_user):
+    """An API key held by a user or by a project, with an unlimited pool. Returns (entity_id, token)."""
     with app.app_context():
-        from lumen.extensions import db
-        from lumen.models.model_config import ModelConfig
+        if request.param == "user":
+            entity_id = test_user["id"]
+        else:
+            from tests.conftest import make_project
+            entity_id = make_project("Consent Project", owner_id=test_user["id"]).id
+        token = f"lk_consent_{request.param}"
+        _add_api_key(entity_id, token)
+        _grant_unlimited_pool(app, entity_id)
+    return entity_id, token
+
+
+class _CompletionResponse:
+    """Serves every upstream call the generation endpoints make."""
+
+    id = "cmpl-1"
+    created = 0
+    model = "dummy"
+
+    class usage:  # noqa: N801 - stands in for the OpenAI usage object
+        prompt_tokens = 1
+        completion_tokens = 1
+        total_tokens = 2
+
+    class _Choice:
+        finish_reason = "stop"
+
+        class message:  # noqa: N801 - stands in for the OpenAI message object
+            content = "hi"
+
+    choices = [_Choice()]
+
+    def model_dump(self):
+        return {"choices": [{"message": {"role": "assistant", "content": "hi"}}],
+                "text": "hi", "usage": {"type": "duration", "seconds": 1}}
+
+
+def _call_list(client, token, model_name):
+    return client.get("/v1/models", headers={"Authorization": f"Bearer {token}"})
+
+
+def _call_detail(client, token, model_name):
+    return client.get(f"/v1/models/{model_name}", headers={"Authorization": f"Bearer {token}"})
+
+
+def _call_chat(client, token, model_name):
+    return client.post(
+        "/v1/chat/completions", headers={"Authorization": f"Bearer {token}"},
+        json={"model": model_name, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+
+def _call_completions(client, token, model_name):
+    return client.post(
+        "/v1/completions", headers={"Authorization": f"Bearer {token}"},
+        json={"model": model_name, "prompt": "hi"},
+    )
+
+
+def _call_transcriptions(client, token, model_name):
+    from io import BytesIO
+    return client.post(
+        "/v1/audio/transcriptions", headers={"Authorization": f"Bearer {token}"},
+        data={"model": model_name, "file": (BytesIO(b"fake-audio-bytes"), "sample.flac")},
+        content_type="multipart/form-data",
+    )
+
+
+_ENDPOINTS = {
+    "list": _call_list,
+    "detail": _call_detail,
+    "chat": _call_chat,
+    "completions": _call_completions,
+    "transcriptions": _call_transcriptions,
+}
+_GENERATION = ("chat", "completions", "transcriptions")
+
+
+def _api_allows(client, token, model_name, endpoint):
+    """True if the endpoint lets the key use the model, False if it refuses it.
+
+    Listing and detail SHOW a model awaiting acknowledgement — that is how a
+    client discovers the requirement and its notice — so on those two surfaces
+    the consent state is read from ``tags`` (no open requirement == usable).
+    Generation answers 403. Any other answer is a test failure rather than a
+    quiet False.
+    """
+    resp = _ENDPOINTS[endpoint](client, token, model_name)
+    if endpoint in ("list", "detail"):
+        assert resp.status_code == HTTPStatus.OK, resp.get_data(as_text=True)
+        if endpoint == "list":
+            entry = next((m for m in resp.get_json()["data"] if m["id"] == model_name), None)
+            assert entry is not None, f"{model_name} missing from /v1/models"
+        else:
+            entry = resp.get_json()
+        return not entry["tags"]
+    assert resp.status_code in (HTTPStatus.OK, HTTPStatus.FORBIDDEN), resp.get_data(as_text=True)
+    return resp.status_code == HTTPStatus.OK
+
+
+@pytest.fixture
+def upstream_ok(monkeypatch):
+    from lumen.blueprints.api import routes
+    _capturing_openai(monkeypatch, routes, lambda **kw: _CompletionResponse())
+
+
+@pytest.mark.parametrize("endpoint", list(_ENDPOINTS))
+@pytest.mark.parametrize("requirement", list(_REQUIREMENTS))
+def test_api_requires_acknowledgment(
+    app, client, test_model, test_model_endpoint, key_entity, upstream_ok, fresh_rate_limit,
+    requirement, endpoint,
+):
+    """Without consent every surface refuses it (open tag, or 403); with consent the call succeeds."""
+    entity_id, token = key_entity
+    with app.app_context():
+        _set_requirements(test_model["id"], **_REQUIREMENTS[requirement])
+
+    assert _api_allows(client, token, test_model["model_name"], endpoint) is False
+
+    with app.app_context():
+        _record_consent(entity_id, test_model["id"])
+
+    assert _api_allows(client, token, test_model["model_name"], endpoint) is True
+
+
+@pytest.mark.parametrize("requirement", list(_REQUIREMENTS))
+def test_profile_acknowledgment_enables_api(
+    app, auth_client, test_user, test_model, test_model_endpoint, api_key, upstream_ok,
+    fresh_rate_limit, requirement,
+):
+    token, _ = api_key
+    with app.app_context():
         _grant_unlimited_pool(app, test_user["id"])
-        db.session.get(ModelConfig, test_model["id"]).needs_ack = True
+        _set_requirements(test_model["id"], **_REQUIREMENTS[requirement])
+
+    assert _api_allows(auth_client, token, test_model["model_name"], "chat") is False
+    resp = auth_client.post(f"/profile/consent/{test_model['model_name']}")
+    assert resp.status_code == HTTPStatus.OK
+    assert _api_allows(auth_client, token, test_model["model_name"], "chat") is True
+
+
+@pytest.mark.parametrize("requirement", list(_REQUIREMENTS))
+def test_project_manager_acknowledgment_enables_api(
+    app, auth_client, test_user, test_model, test_model_endpoint, upstream_ok,
+    fresh_rate_limit, requirement,
+):
+    token = "lk_project_manager_grant"
+    with app.app_context():
+        from tests.conftest import make_project
+        project_id = make_project("Granted Project", owner_id=test_user["id"]).id
+        _add_api_key(project_id, token)
+        _grant_unlimited_pool(app, project_id)
+        _set_requirements(test_model["id"], **_REQUIREMENTS[requirement])
+
+    assert _api_allows(auth_client, token, test_model["model_name"], "chat") is False
+    resp = auth_client.post(f"/projects/{project_id}/consent/{test_model['model_name']}")
+    assert resp.status_code == HTTPStatus.OK
+    assert _api_allows(auth_client, token, test_model["model_name"], "chat") is True
+
+
+@pytest.mark.parametrize("endpoint", list(_ENDPOINTS))
+def test_new_requirement_reblocks_api_until_acknowledged(
+    app, auth_client, test_user, test_model, test_model_endpoint, api_key, upstream_ok,
+    fresh_rate_limit, endpoint,
+):
+    """Adding early_access after a needs_ack consent blocks the API until it is re-acknowledged."""
+    token, _ = api_key
+    with app.app_context():
+        _grant_unlimited_pool(app, test_user["id"])
+        _set_requirements(test_model["id"], needs_ack=True)
+        _record_consent(test_user["id"], test_model["id"])
+
+    assert _api_allows(auth_client, token, test_model["model_name"], endpoint) is True
+
+    with app.app_context():
+        _set_requirements(test_model["id"], needs_ack=True, early_access=True)
+
+    assert _api_allows(auth_client, token, test_model["model_name"], endpoint) is False
+    assert auth_client.post(f"/profile/consent/{test_model['model_name']}").status_code == HTTPStatus.OK
+    assert _api_allows(auth_client, token, test_model["model_name"], endpoint) is True
+
+
+def test_consent_on_owned_model_still_blocked(
+    app, client, test_user, test_model, api_key,
+):
+    """Acknowledgment never grants access to a model the key's entity cannot see."""
+    token, _ = api_key
+    with app.app_context():
+        _grant_unlimited_pool(app, test_user["id"])
+        from lumen.extensions import db
+        from lumen.models.entity import Entity
+        from tests.conftest import set_model_owner
+        owner = Entity(entity_type="user", email="owner@example.com", name="Owner", active=True)
+        db.session.add(owner)
         db.session.commit()
+        set_model_owner(test_model["id"], owner.id)
+        _set_requirements(test_model["id"], needs_ack=True)
+        _record_consent(test_user["id"], test_model["id"])
 
     resp = client.post(
         "/v1/chat/completions",
@@ -532,32 +660,44 @@ def test_consent_true_ack_chat_completions_403(
     assert resp.status_code == HTTPStatus.FORBIDDEN
 
 
-def test_consent_false_owned_model_still_blocked(
-    app, client, test_user, test_model, api_key,
+@pytest.mark.parametrize("endpoint", _GENERATION)
+def test_api_denial_counted_as_needs_consent(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key,
+    fresh_rate_limit, endpoint,
 ):
-    """api.consent=false never bypasses an ownership block."""
     token, _ = api_key
-    _set_api_consent(app, False)
-    try:
-        with app.app_context():
-            _grant_unlimited_pool(app, test_user["id"])
-            from lumen.extensions import db
-            from lumen.models.entity import Entity
-            from tests.conftest import set_model_owner
-            owner = Entity(entity_type="user", email="owner@example.com", name="Owner", active=True)
-            db.session.add(owner)
-            db.session.commit()
-            set_model_owner(test_model["id"], owner.id)
+    with app.app_context():
+        _grant_unlimited_pool(app, test_user["id"])
+        _set_requirements(test_model["id"], needs_ack=True)
+    recorded = []
+    monkeypatch.setattr(
+        "lumen.blueprints.metrics.middleware.observe_rejection",
+        lambda reason, source, model="": recorded.append((reason, source, model)),
+    )
 
-        resp = client.post(
-            "/v1/chat/completions",
-            headers={"Authorization": f"Bearer {token}"},
-            json={"model": test_model["model_name"],
-                  "messages": [{"role": "user", "content": "hi"}]},
-        )
+    assert _ENDPOINTS[endpoint](client, token, test_model["model_name"]).status_code == HTTPStatus.FORBIDDEN
+    assert recorded == [("needs_consent", "api", test_model["model_name"])]
+
+
+def test_monitor_token_lists_unacknowledged_model(app, client, test_model, monkeypatch):
+    """The monitor token is outside the acknowledgment gate for discovery only."""
+    monitor = "monitor-secret-token-ack"
+    monkeypatch.setitem(app.config, "YAML_DATA", {**app.config.get("YAML_DATA", {}),
+                                                  "api": {"monitoring": {"token": monitor}}})
+    with app.app_context():
+        _set_requirements(test_model["id"], needs_ack=True, early_access=True)
+
+    resp = client.get("/v1/models", headers={"Authorization": f"Bearer {monitor}"})
+    assert resp.status_code == HTTPStatus.OK
+    assert test_model["model_name"] in [m["id"] for m in resp.get_json()["data"]]
+
+    resp = client.get(f"/v1/models/{test_model['model_name']}", headers={"Authorization": f"Bearer {monitor}"})
+    assert resp.status_code == HTTPStatus.OK
+
+    for call in (_call_chat, _call_completions, _call_transcriptions):
+        resp = call(client, monitor, test_model["model_name"])
         assert resp.status_code == HTTPStatus.FORBIDDEN
-    finally:
-        _set_api_consent(app, True)
+        assert resp.get_json()["error"]["type"] == "authentication_error"
 
 
 # ---------------------------------------------------------------------------
@@ -849,6 +989,80 @@ def test_monitor_token_cannot_acknowledge(app, client, test_model):
     assert resp.get_json()["error"]["type"] == "authentication_error"
 
 
+def test_acknowledge_slashed_model_and_alias(app, client, test_user, test_model, api_key):
+    """Model ids containing slashes reach the routes; the default converter
+    used to 404 org/model-style names before the handler could run."""
+    token, _ = api_key
+    canonical = "acme/gpt-mini"
+    alias = "team/gpt-mini-beta"
+    with app.app_context():
+        from lumen.extensions import db
+        _grant_unlimited_pool(app, test_user["id"])
+        _set_model_flag(app, test_model, needs_ack=True, ack_message="Be good.",
+                        model_name=canonical)
+        from lumen.models.model_alias import ModelAlias
+        db.session.add(ModelAlias(alias=alias, model_config_id=test_model["id"]))
+        db.session.commit()
+
+    headers = {"Authorization": f"Bearer {token}"}
+    detail = client.get(f"/v1/models/{canonical}", headers=headers)
+    assert detail.status_code == HTTPStatus.OK
+    assert detail.get_json()["tags"] == ["needs_ack"]
+
+    resp = client.post(f"/v1/models/{canonical}/acknowledge", headers=headers)
+    assert resp.status_code == HTTPStatus.OK
+    assert resp.get_json()["tags"] == []
+
+    resp = client.post(f"/v1/models/{alias}/acknowledge", headers=headers)
+    assert resp.status_code == HTTPStatus.OK
+    body = resp.get_json()
+    assert body["id"] == alias
+    assert body["tags"] == []
+
+
+def test_acknowledge_concurrent_first_ack_returns_persisted_state(
+    app, client, test_user, test_model, api_key, monkeypatch,
+):
+    """Losing the first-ack insert race returns the winner's row, not a 500.
+
+    Two requests for one entity/model (overlapping retries, or two keys of one
+    account) both read no consent row; the loser must stay idempotent.
+    """
+    token, _ = api_key
+    with app.app_context():
+        _grant_unlimited_pool(app, test_user["id"])
+        _set_model_flag(app, test_model, needs_ack=True)
+
+    from datetime import timedelta
+
+    from sqlalchemy import insert as sa_insert
+
+    from lumen.extensions import db
+    from lumen.models.entity_model_consent import EntityModelConsent
+
+    winner_at = utcnow() - timedelta(hours=1)
+    orig_init = EntityModelConsent.__init__
+
+    def racing_init(self, **kw):
+        # Stand in for the concurrent winner: its row lands between this
+        # handler's SELECT and its own savepoint commit.
+        db.session.execute(sa_insert(EntityModelConsent).values(
+            **kw, consented_at=winner_at,
+        ))
+        orig_init(self, **kw)
+
+    monkeypatch.setattr(EntityModelConsent, "__init__", racing_init)
+    resp = client.post(
+        f"/v1/models/{test_model['model_name']}/acknowledge",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == HTTPStatus.OK
+    body = resp.get_json()
+    assert body["tags"] == []
+    # The winner's timestamp, not the loser's: the persisted state is reported.
+    assert body["acknowledged_at"] == winner_at.isoformat() + "Z"
+
+
 def test_list_models_includes_unacked_needs_ack_with_fields(
     app, client, test_user, test_model, test_model_endpoint, api_key,
 ):
@@ -959,35 +1173,32 @@ def test_chat_completions_unacked_returns_consent_required_code(
     assert err["message"] == "No access to this model"
 
 
-def test_acknowledge_available_when_api_consent_disabled(
-    app, client, test_user, test_model, api_key,
+def test_zero_pool_unacked_returns_generic_403(
+    app, client, test_user, test_model, api_key, fresh_rate_limit,
 ):
-    """api.consent=false: the endpoint remains available and simply reports state."""
+    """A 0-coin entity on an un-acked model gets the generic 403, not
+    consent_required: the acknowledge endpoint 404s this entity no matter what
+    it acks, so pointing it there would be a dead end."""
     token, _ = api_key
-    _set_api_consent(app, False)
-    try:
-        with app.app_context():
-            _grant_unlimited_pool(app, test_user["id"])
-            _set_model_flag(app, test_model, needs_ack=True)
-        resp = client.post(
-            f"/v1/models/{test_model['model_name']}/acknowledge",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        assert resp.status_code == HTTPStatus.OK
-        assert resp.get_json()["tags"] == []
-        # Regression guard: with consent enforcement off the ack must not
-        # create a consent row that takes effect if enforcement returns.
-        with app.app_context():
-            from lumen.extensions import db
-            from lumen.models.entity_model_consent import EntityModelConsent
-            count = db.session.execute(
-                select(func.count())
-                .select_from(EntityModelConsent)
-                .filter_by(entity_id=test_user["id"], model_config_id=test_model["id"])
-            ).scalar()
-            assert count == 0
-    finally:
-        _set_api_consent(app, True)
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity_limit import EntityLimit
+        db.session.add(EntityLimit(
+            entity_id=test_user["id"], max_coins=0, refresh_coins=0, starting_coins=0,
+        ))
+        _set_model_flag(app, test_model, needs_ack=True)
+
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = client.post(
+        "/v1/chat/completions", headers=headers,
+        json={"model": test_model["model_name"],
+              "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert resp.status_code == HTTPStatus.FORBIDDEN
+    assert "code" not in resp.get_json()["error"]
+
+    ack = client.post(f"/v1/models/{test_model['model_name']}/acknowledge", headers=headers)
+    assert ack.status_code == HTTPStatus.NOT_FOUND
 
 
 def test_list_models_response_includes_required_openai_fields(

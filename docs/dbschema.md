@@ -15,6 +15,7 @@ erDiagram
         string gravatar_hash
         bool active
         bool store_conversations
+        int owner_entity_id FK
         datetime created_at
     }
 
@@ -24,7 +25,7 @@ erDiagram
         string name
         string key_hash
         string key_hint
-        bool active
+        datetime revoked_at
         int requests
         bigint input_tokens
         bigint output_tokens
@@ -35,6 +36,7 @@ erDiagram
         string client_id
         string requested_by
         int created_by_entity_id FK
+        int revoked_by_entity_id FK
     }
 
     auth_requests {
@@ -161,18 +163,11 @@ erDiagram
         numeric starting_coins
     }
 
-    model_group_access {
-        int id PK
-        int model_config_id FK
-        int group_id FK
-        datetime created_at
-    }
-
     entity_managers {
         int id PK
         int user_entity_id FK
         int project_entity_id FK
-        boolean is_owner
+        string role
     }
 
     model_stats {
@@ -247,6 +242,7 @@ erDiagram
 
     entities ||--o{ api_keys : "owns"
     entities |o--o{ api_keys : "created"
+    entities |o--o{ api_keys : "revoked"
     entities |o--o{ auth_requests : "approves"
     api_keys |o--o{ auth_requests : "minted at claim"
     entities ||--o| entity_limits : "has"
@@ -260,16 +256,15 @@ erDiagram
     entities ||--o{ request_logs : "logs"
     entities ||--o{ entity_managers : "manages (user)"
     entities ||--o{ entity_managers : "managed by (project)"
+    entity_managers |o--o| entities : "owns (project owner)"
 
     groups ||--o{ group_members : "contains"
     groups ||--o{ group_rules : "auto-join rules"
     groups ||--o| group_limits : "has"
-    groups ||--o{ model_group_access : "granted"
 
     model_configs ||--o{ model_endpoints : "served by"
     model_configs ||--o{ model_aliases : "versioned as"
     model_configs ||--o{ entity_model_consents : "consented via"
-    model_configs ||--o{ model_group_access : "granted to"
     model_configs ||--o{ model_stats : "accumulates"
     model_configs ||--o{ request_logs : "logs"
 
@@ -293,7 +288,6 @@ erDiagram
 - [group\_members](#group_members)
 - [group\_rules](#group_rules)
 - [group\_limits](#group_limits)
-- [model\_group\_access](#model_group_access)
 - [entity\_managers](#entity_managers)
 - [model\_stats](#model_stats)
 - [entity\_stats](#entity_stats)
@@ -319,11 +313,17 @@ Unified table for both human users (authenticated via OAuth) and programmatic pr
 | `gravatar_hash` | String(64) | YES | MD5 hash of the user's email for Gravatar lookups; users only |
 | `active` | Boolean | NO | Whether the entity can make requests. Inactive entities are blocked. |
 | `store_conversations` | Boolean | NO | Whether webchat conversations are persisted for this user. Default `true`. |
+| `owner_entity_id` | Integer (FK → entity_managers) | YES | Owning user of a project; required for projects, null for users. Together with `id` it references the owner's `entity_managers` row, so the owner is always one of the project's managers. |
 | `created_at` | DateTime | NO | UTC timestamp when the entity was created |
 
+**Constraints:**
+- `ck_entities_project_owner` — `CHECK ((entity_type = 'project' AND owner_entity_id IS NOT NULL) OR (entity_type <> 'project' AND owner_entity_id IS NULL))`: every project has exactly one owner and users have none.
+- `fk_entities_owner_membership` — `FOREIGN KEY (owner_entity_id, id) REFERENCES entity_managers (user_entity_id, project_entity_id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED`. The owner's manager row cannot be deleted while they own the project (transfer ownership first). Deferred so a project and its owner's manager row can be inserted in the same transaction. Not enforced on SQLite, which runs without foreign keys.
+
 **Notes:**
-- All foreign keys that reference `entities.id` cascade on delete, except `model_configs.owner_entity_id`, `api_keys.created_by_entity_id`, and the `request_logs` FKs, which use `SET NULL`.
+- All foreign keys that reference `entities.id` cascade on delete, except `model_configs.owner_entity_id`, `api_keys.created_by_entity_id`, `api_keys.revoked_by_entity_id`, and the `request_logs` FKs, which use `SET NULL`.
 - Acknowledgement (`needs_ack`) is a property of the model, not of the entity.
+- Deleting a user who owns a project fails on `fk_entities_owner_membership`; transfer ownership first.
 
 ---
 
@@ -338,7 +338,7 @@ API keys that entities (users or projects) use to authenticate against the proxy
 | `name` | String(128) | NO | Human-readable label for the key (e.g., "Production bot") |
 | `key_hash` | String(64) | NO | SHA-256 hash of the raw key. Unique. |
 | `key_hint` | String(32) | YES | Last few characters of the raw key shown in the UI for identification |
-| `active` | Boolean | NO | Whether the key is currently usable |
+| `revoked_at` | DateTime | YES | UTC time the key was revoked; null while the key is usable. Approximate (`last_used_at`, else `created_at`, else the migration time) for keys revoked before this column existed. |
 | `requests` | Integer | NO | Cumulative request count made with this key |
 | `input_tokens` | BigInteger | NO | Cumulative input tokens consumed via this key |
 | `output_tokens` | BigInteger | NO | Cumulative output tokens produced via this key |
@@ -349,6 +349,7 @@ API keys that entities (users or projects) use to authenticate against the proxy
 | `client_id` | String(128) | YES | Application label the key was requested through via the OAuth flows; null for keys created on the profile page |
 | `requested_by` | String(128) | YES | Requester-supplied author label from the OAuth request (unverified) |
 | `created_by_entity_id` | Integer (FK → entities) | YES | The user who created this key (the approving user for OAuth claims). Null for legacy keys; SET NULL on creator deletion. |
+| `revoked_by_entity_id` | Integer (FK → entities) | YES | The user who revoked this key (the approving user for an OAuth overwrite). Null while the key is usable, for keys revoked before this column existed, for system revocations (OAuth authorization-code replay), and when the revoker is deleted (SET NULL). |
 
 ---
 
@@ -395,7 +396,7 @@ Configuration and metadata for each AI model that Lumen can proxy. One row per l
 | `input_cost_per_million` | Numeric(12,6) | NO | USD cost per one million input tokens |
 | `output_cost_per_million` | Numeric(12,6) | NO | USD cost per one million output tokens |
 | `audio_cost_per_hour` | Numeric(12,6) | YES | USD cost per hour of audio; only set for speech-to-text (ASR) models |
-| `owner_entity_id` | Integer (FK → entities) | YES | Owning user entity; NULL = available to everyone. When set, only the owner and members of granted groups may use the model. `SET NULL` on delete — deleting the owner makes the model public again. |
+| `owner_entity_id` | Integer (FK → entities) | YES | Owning user entity; NULL = available to everyone. When set, only the owner may use the model. `SET NULL` on delete — deleting the owner makes the model public again. |
 | `needs_ack` | Boolean | NO | Requires user acknowledgement before use; a sticky model-level property that no scope can add or remove. Default `false`. |
 | `ack_message` | Text | YES | Per-model acknowledgement message; overrides the global `defaults.models.ack_message`. |
 | `early_access` | Boolean | NO | Early-access model: users must acknowledge it may change or be removed before use. A sticky model-level property like `needs_ack`. Default `false`. |
@@ -415,7 +416,7 @@ Configuration and metadata for each AI model that Lumen can proxy. One row per l
 
 **Notes:**
 - `active` is a derived, read-only property (`active = not disabled and (end_date is null or end_date > now)`), not a stored column. It replaces the old `active` column.
-- `owner_entity_id` and the `model_group_access` grants are DB-managed (edited via the model detail page), never synced from `config.yaml`.
+- `owner_entity_id` is DB-managed (edited via the model detail page), never synced from `config.yaml`.
 
 ---
 
@@ -521,7 +522,7 @@ Association table linking entities to groups. An entity may belong to multiple g
 | `group_id` | Integer (FK → groups) | NO | The group. Cascades on delete. |
 | `entity_id` | Integer (FK → entities) | NO | The entity that belongs to the group. Cascades on delete. |
 | `config_managed` | Boolean | NO | When `true`, assigned automatically at login by the group's auto-join rules; reconciled (added/removed) at each login. Manual memberships are `false`. |
-| `is_owner` | Boolean | NO | True for the group owner; at most one owner per group (enforced by app logic). The owner may add/remove members, transfer ownership, grant models they own, and deactivate the group. |
+| `is_owner` | Boolean | NO | True for the group owner; at most one owner per group (enforced by app logic). The owner may add/remove members, transfer ownership, and deactivate the group. |
 | `joined_at` | DateTime | YES | UTC timestamp when the membership was created; `NULL` for memberships that predate the column (join time unknown) |
 
 **Constraints:** `UNIQUE(group_id, entity_id)`
@@ -558,33 +559,18 @@ Coin budget configuration for a group. Works identically to `entity_limits` but 
 
 ---
 
-## model_group_access
-
-Group grants for owned models; a row gives all group members access to the model. Only meaningful for models with an `owner_entity_id` set — a model with no owner is available to everyone and needs no grants. Grants are edited by admins on the model detail page; deleting a granted group removes the grant.
-
-| Column | Type | Nullable | Description |
-|--------|------|----------|-------------|
-| `id` | Integer | NO | Primary key |
-| `model_config_id` | Integer (FK → model_configs) | NO | The owned model being granted. Cascades on delete. |
-| `group_id` | Integer (FK → groups) | NO | The group whose members receive access. Cascades on delete. |
-| `created_at` | DateTime | NO | UTC timestamp when the grant was created |
-
-**Constraints:** `UNIQUE(model_config_id, group_id)` (`uq_mga_model_group`); index `ix_model_group_access_group_id` on `group_id`
-
----
-
 ## entity_managers
 
-Maps users to the project entities they are permitted to manage. A manager can view and administer a project's API keys and usage. The `is_owner` flag designates the project owner — a manager who can additionally add/remove managers, transfer ownership, and activate/deactivate the project. At most one owner per project (enforced by app logic).
+Maps users to the project entities they are members of. `role` is `'manager'` or `'user'`. A manager can view and administer a project's API keys and usage. The project owner is the member that `entities.owner_entity_id` points at — a manager who can additionally add/remove managers, transfer ownership, and activate/deactivate the project. `get_project_role()` in `lumen/models/entity_manager.py` returns `'owner'`, `'manager'`, `'user'`, or `None` for a non-member.
 
 | Column | Type | Nullable | Description |
 |--------|------|----------|-------------|
 | `id` | Integer | NO | Primary key |
-| `user_entity_id` | Integer (FK → entities) | NO | The user (must be `entity_type = 'user'`) who has management rights. Cascades on delete. |
-| `project_entity_id` | Integer (FK → entities) | NO | The project entity being managed. Cascades on delete. |
-| `is_owner` | Boolean | NO | True for the project owner; at most one owner per project (enforced by app logic). Default `false`. |
+| `user_entity_id` | Integer (FK → entities) | NO | The member user (must be `entity_type = 'user'`); their rights depend on `role`. Cascades on delete. |
+| `project_entity_id` | Integer (FK → entities) | NO | The project the user is a member of. Cascades on delete. |
+| `role` | String(16) | NO | Project role: `'manager'` or `'user'`. Defaults to `'manager'`; rows that existed before the column was added are managers. The owner keeps their own row (normally `'manager'`) — ownership is the `entities.owner_entity_id` pointer, not a role value. |
 
-**Constraints:** `UNIQUE(user_entity_id, project_entity_id)`
+**Constraints:** `UNIQUE(user_entity_id, project_entity_id)`, also the target of `entities.fk_entities_owner_membership`; `ck_entity_managers_role` — `CHECK (role IN ('manager', 'user'))`
 
 ---
 
@@ -833,15 +819,15 @@ command with a dry run as its default.
 ```
 groups ──< group_members >── entities ──< api_keys
   │                              │
-  ├──< group_limits              ├──< entity_limits
-  │                              ├──< entity_balances
-  └──< model_group_access        ├──< entity_model_consents
+  └──< group_limits              ├──< entity_limits
+                                 ├──< entity_balances
+                                 ├──< entity_model_consents
                                  ├──< entity_managers (user→project)
 model_configs ──< model_endpoints├──< model_stats
      │                           ├──< conversations ──< messages
      ├──> entities (owner_entity_id, SET NULL)
-      ├──< model_aliases          ├──< auth_requests (approves)
-      ├──< model_group_access     └──< request_logs
+     ├──< model_aliases          ├──< auth_requests (approves)
+     │                           └──< request_logs
      └──< model_stats / request_logs
 ```
 
@@ -852,8 +838,7 @@ When determining whether an entity (user or project) may use a model, Lumen eval
 1. **Disabled or expired** — `model_configs.disabled = true` or `end_date` in the past → blocked, not overridable.
 2. **No owner** — `model_configs.owner_entity_id` is NULL → allowed (the model is available to everyone).
 3. **Entity is the owner** — the entity is `owner_entity_id` → allowed.
-4. **Granted group** — the entity is a member of an **active** group that has a `model_group_access` row for the model → allowed.
-5. **Otherwise** → blocked.
+4. **Otherwise** → blocked. Group membership never opens an owned model.
 
 Independently, if the model has `needs_ack = true` or `early_access = true`, an allowed entity must still record acknowledgement in `entity_model_consents` before using the model ("needs_ack" until consent).
 

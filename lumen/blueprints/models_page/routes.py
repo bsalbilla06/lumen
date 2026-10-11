@@ -6,14 +6,11 @@ import requests as http_requests
 from flask import Blueprint, abort, render_template, session
 from sqlalchemy import func, select
 
-from lumen.decorators import is_admin, login_required
+from lumen.decorators import login_required
 from lumen.extensions import db
-from lumen.models.entity import Entity
 from lumen.models.entity_model_consent import EntityModelConsent
-from lumen.models.group import Group
 from lumen.models.model_config import ModelConfig
 from lumen.models.model_endpoint import ModelEndpoint
-from lumen.models.model_group_access import ModelGroupAccess
 from lumen.models.request_log import RequestLog
 from lumen.services.llm import _consent_satisfied, bulk_model_access_info, get_model_access_status, model_notices
 from lumen.services.model_resolver import resolve_model_config
@@ -40,13 +37,26 @@ def _visible_model_or_404(model_name):
 def index():
     entity_id = session.get("entity_id")
     all_configs = db.session.execute(select(ModelConfig).where(ModelConfig.active).order_by(ModelConfig.model_name)).scalars().all()
-    access_statuses, _ = bulk_model_access_info(entity_id, [c.id for c in all_configs])
+    access_statuses, consent_map = bulk_model_access_info(entity_id, [c.id for c in all_configs])
     configs = [c for c in all_configs if access_statuses.get(c.id, "allowed") != "blocked"]
     model_ids = [c.id for c in configs]
+    # Acknowledgement state for the Access column. consent_map only holds models
+    # whose requirements are all satisfied, so a requirement added after consent
+    # re-shows the pills.
+    ack_map = {}
+    for c in configs:
+        if access_statuses.get(c.id) == "needs_ack":
+            notice, early_notice = model_notices(c)
+            ack_map[c.id] = {
+                "consented": c.id in consent_map,
+                "consent_at": consent_map.get(c.id),
+                "notice": notice,
+                "early_notice": early_notice,
+            }
     endpoints_map: dict[int, list] = {}
     for ep in db.session.execute(select(ModelEndpoint).where(ModelEndpoint.model_config_id.in_(model_ids), ModelEndpoint.active.is_(True))).scalars().all():
         endpoints_map.setdefault(ep.model_config_id, []).append(ep)
-    return render_template("models.html", configs=configs, endpoints_map=endpoints_map)
+    return render_template("models.html", configs=configs, endpoints_map=endpoints_map, ack_map=ack_map)
 
 
 @models_page_bp.route("/models/<path:model_name>")
@@ -96,18 +106,6 @@ def detail(model_name):
         times = [t for t in (consent.consented_at, consent.early_access_at) if t is not None]
         consent_display_at = max(times) if times else None
 
-    # Shown in the admin-only Access card; the edit dialog fetches fresh data on open.
-    granted_group_names = []
-    viewer = db.session.get(Entity, entity_id) if entity_id else None
-    if viewer and is_admin(viewer):
-        granted_group_names = [
-            name for (name,) in db.session.execute(
-                select(Group.name)
-                .join(ModelGroupAccess, ModelGroupAccess.group_id == Group.id)
-                .where(ModelGroupAccess.model_config_id == config.id)
-                .order_by(Group.name)
-            ).all()
-        ]
     return render_template(
         "model_detail.html",
         config=config,
@@ -122,7 +120,6 @@ def detail(model_name):
         consent_display_at=consent_display_at,
         effective_notice=effective_notice,
         early_access_notice=early_access_notice if access_status == "needs_ack" else None,
-        granted_group_names=granted_group_names,
     )
 
 

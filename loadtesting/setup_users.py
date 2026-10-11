@@ -23,7 +23,7 @@ def parse_args():
     p.add_argument("--model", default="dummy", help="Model name to grant coins for (default: dummy)")
     p.add_argument("--coins", type=int, default=20, help="Coins to grant per user (default: 20)")
     p.add_argument("--prefix", default="loadtest", help="Entity name prefix (default: loadtest)")
-    p.add_argument("--group", default=None, help="Add each entity to this group (e.g. staff) for model access")
+    p.add_argument("--group", default=None, help="Add each entity to this group (e.g. staff) for its coin policy")
     p.add_argument("--write-config", action="store_true", help="Update loadtesting/config.yaml with the new keys")
     return p.parse_args()
 
@@ -40,11 +40,11 @@ def main():
     from lumen.models.entity import Entity
     from lumen.models.entity_balance import EntityBalance
     from lumen.models.entity_limit import EntityLimit
+    from lumen.models.entity_manager import EntityManager
     from lumen.models.entity_model_consent import EntityModelConsent
     from lumen.models.group import Group
     from lumen.models.group_member import GroupMember
     from lumen.models.model_config import ModelConfig
-    from lumen.models.model_group_access import ModelGroupAccess
     from lumen.services.crypto import hash_api_key
     from lumen.timeutils import utcnow
 
@@ -67,19 +67,24 @@ def main():
                 sys.exit(1)
 
         if model_config.owner_entity_id is not None:
-            granted = group is not None and db.session.execute(
-                select(ModelGroupAccess.id).where(
-                    ModelGroupAccess.model_config_id == model_config.id,
-                    ModelGroupAccess.group_id == group.id,
-                )
-            ).scalar_one_or_none() is not None
-            if not granted:
-                print(
-                    f"ERROR: Model '{args.model}' is owned. Pass --group for a group already "
-                    "granted access to that model.",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
+            print(
+                f"ERROR: Model '{args.model}' is owned and only its owner can use it. "
+                "Load-test users need a public (unowned) model.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Every project needs an owner who also manages it; one shared
+        # placeholder user owns all the load-test projects.
+        owner_email = f"{args.prefix}-owner@example.invalid"
+        owner = db.session.execute(
+            select(Entity).filter_by(email=owner_email, entity_type="user")
+        ).scalar_one_or_none()
+        if owner is None:
+            owner = Entity(entity_type="user", email=owner_email, name=f"{args.prefix} owner",
+                           initials=args.prefix[:4].upper(), active=True)
+            db.session.add(owner)
+            db.session.flush()
 
         raw_keys = []
         for i in range(1, args.count + 1):
@@ -90,9 +95,11 @@ def main():
                 name=name,
                 initials=args.prefix[:4].upper(),
                 active=True,
+                owner_entity_id=owner.id,
             )
             db.session.add(entity)
             db.session.flush()  # populate entity.id
+            db.session.add(EntityManager(user_entity_id=owner.id, project_entity_id=entity.id))
 
             raw_key = "sk_" + secrets.token_urlsafe(32)
             api_key = APIKey(
@@ -100,7 +107,6 @@ def main():
                 name=name,
                 key_hash=hash_api_key(raw_key),
                 key_hint=f"{raw_key[:7]}...{raw_key[-4:]}",
-                active=True,
             )
             db.session.add(api_key)
 

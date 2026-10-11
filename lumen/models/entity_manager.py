@@ -1,24 +1,28 @@
+from typing import Literal, Optional
+
 from sqlalchemy import select
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, aliased, mapped_column, relationship
 
 from ..extensions import db
 from .entity import Entity
 
 
 class EntityManager(db.Model):
-    """Maps a user to a project entity they are permitted to manage.
+    """Maps a user to a project entity they are a member of.
 
-    A manager can view and administer the project's API keys and usage data.
-    Both FKs reference the entities table; user_entity_id must be a 'user'
-    entity and project_entity_id must be a 'project' entity (enforced by app logic).
+    role is 'manager' (can view and administer the project's API keys and
+    usage data) or 'user'. Both FKs reference the entities table;
+    user_entity_id must be a 'user' entity and project_entity_id must be a
+    'project' entity (enforced by app logic). The project's owner is the
+    member that entities.owner_entity_id points at.
     """
 
     __tablename__ = "entity_managers"
 
     id: Mapped[int] = mapped_column(db.Integer, primary_key=True, comment="Primary key")
-    user_entity_id: Mapped[int] = mapped_column(db.Integer, db.ForeignKey("entities.id", ondelete="CASCADE"), comment="The user who has management rights over the project")
-    project_entity_id: Mapped[int] = mapped_column(db.Integer, db.ForeignKey("entities.id", ondelete="CASCADE"), comment="The project entity being managed")
-    is_owner: Mapped[bool] = mapped_column(db.Boolean, default=False, nullable=False, comment="True for the project owner; at most one owner per project (enforced by app logic)")
+    user_entity_id: Mapped[int] = mapped_column(db.Integer, db.ForeignKey("entities.id", ondelete="CASCADE"), comment="The member user; their rights depend on role")
+    project_entity_id: Mapped[int] = mapped_column(db.Integer, db.ForeignKey("entities.id", ondelete="CASCADE"), comment="The project the user is a member of")
+    role: Mapped[str] = mapped_column(db.String(16), nullable=False, default="manager", server_default="manager", comment="Project role: 'manager' or 'user'; the owner is the member entities.owner_entity_id points at")
 
     user: Mapped["Entity"] = relationship(foreign_keys=[user_entity_id], backref="managed_projects_assoc")
     project: Mapped["Entity"] = relationship(foreign_keys=[project_entity_id], backref="manager_assoc")
@@ -26,17 +30,8 @@ class EntityManager(db.Model):
     __table_args__ = (
         db.UniqueConstraint("user_entity_id", "project_entity_id"),
         db.Index("ix_entity_managers_project_entity_id", "project_entity_id"),
-        # At most one owner per project, enforced in the database: two
-        # concurrent ownership transfers would otherwise both commit
-        # is_owner=True, after which get_project_owner() raises for everyone.
-        db.Index(
-            "uq_entity_managers_owner",
-            "project_entity_id",
-            unique=True,
-            postgresql_where=db.text("is_owner"),
-            sqlite_where=db.text("is_owner"),
-        ),
-        {"comment": "Maps users to project entities they are permitted to manage"},
+        db.CheckConstraint("role IN ('manager', 'user')", name="ck_entity_managers_role"),
+        {"comment": "Maps users to the project entities they are members of"},
     )
 
 
@@ -60,24 +55,40 @@ def get_managed_projects(user_entity_id: int):
 
 
 def get_project_owner(project_entity_id: int):
-    """The user Entity that owns this project, or None if no owner is set."""
+    """The user Entity that owns this project (entities.owner_entity_id)."""
+    project = aliased(Entity)
     return db.session.execute(
         select(Entity)
-        .join(EntityManager, EntityManager.user_entity_id == Entity.id)
-        .where(
-            EntityManager.project_entity_id == project_entity_id,
-            EntityManager.is_owner == True,  # noqa: E712 — SQL comparison, not a truth check
-        )
+        .join(project, project.owner_entity_id == Entity.id)
+        .where(project.id == project_entity_id)
     ).scalar_one_or_none()
 
 
 def is_project_owner(user_entity_id: int, project_entity_id: int) -> bool:
     """True if user_entity_id is the owner of project_entity_id."""
-    assoc = db.session.execute(
-        select(EntityManager).filter_by(
-            user_entity_id=user_entity_id,
-            project_entity_id=project_entity_id,
-            is_owner=True,
+    return db.session.scalar(
+        select(Entity.id).where(
+            Entity.id == project_entity_id,
+            Entity.owner_entity_id == user_entity_id,
         )
-    ).scalar_one_or_none()
-    return assoc is not None
+    ) is not None
+
+
+def get_project_role(user_entity_id: int, project_entity_id: int) -> Optional[Literal["owner", "manager", "user"]]:
+    """The user's role in the project: 'owner', 'manager', 'user', or None.
+
+    'owner' when entities.owner_entity_id points at the user; otherwise the
+    role on their entity_managers row; None when they are not a member.
+    """
+    row = db.session.execute(
+        select(EntityManager.role, Entity.owner_entity_id)
+        .join(Entity, Entity.id == EntityManager.project_entity_id)
+        .where(
+            EntityManager.user_entity_id == user_entity_id,
+            EntityManager.project_entity_id == project_entity_id,
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    role, owner_entity_id = row
+    return "owner" if owner_entity_id == user_entity_id else role
